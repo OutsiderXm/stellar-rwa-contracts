@@ -7,7 +7,19 @@
 //! (for both sender and recipient) and on every mint (for the recipient).
 //!
 //! Time is expressed in ledger sequence numbers (`u32`), not wall-clock dates.
-//! An `expires_at` of `0` means the KYC approval never expires.
+//!
+//! ## The `expires_at = 0` sentinel
+//!
+//! `KycRecord::expires_at` uses `0` as a sentinel meaning the approval
+//! **never expires**. This is load-bearing: the web app and every caller of
+//! `add_to_allowlist` rely on passing `0` to mean "no expiry", and
+//! [`ComplianceContract::is_allowed`] specifically checks
+//! `record.expires_at != 0` before comparing against the current ledger
+//! sequence — a record with `expires_at == 0` is therefore never subject to
+//! the expiry check, regardless of how many ledgers pass. `0` is otherwise
+//! not a reachable ledger sequence for a real expiry (ledger sequence numbers
+//! start counting from genesis at 1), so there is no ambiguity with a
+//! genuinely-expired record.
 
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, symbol_short, Address, Env, String, Vec,
@@ -33,7 +45,11 @@ pub struct KycRecord {
     pub jurisdiction: String,
     /// Ledger sequence at which the record was verified.
     pub verified_at: u32,
-    /// Ledger sequence at which approval expires; `0` = never expires.
+    /// Ledger sequence at which approval expires.
+    ///
+    /// Sentinel: `0` means the approval **never expires**. See the
+    /// module-level "The `expires_at = 0` sentinel" section for why this is
+    /// safe and how [`ComplianceContract::is_allowed`] treats it.
     pub expires_at: u32,
 }
 

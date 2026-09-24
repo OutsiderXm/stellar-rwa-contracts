@@ -31,6 +31,13 @@ pass `is_allowed`.
 
 > Time is measured in **ledger sequence numbers**, not calendar dates.
 
+> **The `expires_at = 0` sentinel.** `0` means the approval **never
+> expires**. This is load-bearing: the web app passes `0` for
+> non-expiring approvals, and `is_allowed` skips the expiry comparison
+> entirely whenever `expires_at == 0`, so a zero-expiry record can never
+> lapse no matter how far the ledger advances. `0` is never a real expiry
+> ledger sequence, so there is no collision with genuinely-expired records.
+
 ## Functions
 
 ### `initialize(admin: Address)`

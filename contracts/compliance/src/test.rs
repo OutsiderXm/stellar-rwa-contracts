@@ -381,3 +381,21 @@ fn test_prune_expired_removes_from_allowlist() {
     assert!(client.get_record(&user_expire).is_none());
     assert!(client.get_record(&user_persist).is_some());
 }
+
+// ---- issue: expires_at = 0 sentinel never lapses ----
+
+#[test]
+fn test_zero_expiry_never_lapses() {
+    let (env, client, admin) = setup();
+    let user = Address::generate(&env);
+    let us = String::from_str(&env, "US");
+    client.add_to_allowlist(&admin, &user, &us, &0);
+    assert!(client.is_allowed(&user));
+
+    // Advance the ledger sequence far past any realistic expiry and confirm
+    // a zero-expiry record is still valid.
+    env.ledger().with_mut(|l| l.sequence_number = 10_000_000);
+    assert!(client.is_allowed(&user));
+    let rec = client.get_record(&user).unwrap();
+    assert_eq!(rec.expires_at, 0);
+}
