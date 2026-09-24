@@ -20,6 +20,10 @@ via a cross-contract call into the compliance contract.
 
 Full addresses and the sample asset are in [DEPLOYMENTS.md](DEPLOYMENTS.md).
 
+Every privileged (admin- or self-authorized) function across all four
+contracts, the role it requires, and the error raised for the wrong caller
+is documented in the [Authority Matrix](docs/AUTHORITY_MATRIX.md).
+
 ## How compliance gating works
 
 ```
