@@ -103,6 +103,43 @@ fn test_expired_kyc_not_allowed() {
     assert!(!client.is_allowed(&user));
 }
 
+// Issue #341: pin the exact boundary at which a KYC approval lapses.
+// Semantics: `expires_at` is exclusive — the record is valid through
+// ledger `expires_at - 1`, and is expired starting at ledger `expires_at`
+// itself (not one ledger after it).
+#[test]
+fn test_expiry_boundary_one_before_is_allowed() {
+    let (env, client, admin) = setup();
+    let user = Address::generate(&env);
+    let us = String::from_str(&env, "US");
+    env.ledger().with_mut(|l| l.sequence_number = 10);
+    client.add_to_allowlist(&admin, &user, &us, &100);
+    env.ledger().with_mut(|l| l.sequence_number = 99);
+    assert!(client.is_allowed(&user));
+}
+
+#[test]
+fn test_expiry_boundary_exactly_at_expiry_is_expired() {
+    let (env, client, admin) = setup();
+    let user = Address::generate(&env);
+    let us = String::from_str(&env, "US");
+    env.ledger().with_mut(|l| l.sequence_number = 10);
+    client.add_to_allowlist(&admin, &user, &us, &100);
+    env.ledger().with_mut(|l| l.sequence_number = 100);
+    assert!(!client.is_allowed(&user));
+}
+
+#[test]
+fn test_expiry_boundary_one_after_is_expired() {
+    let (env, client, admin) = setup();
+    let user = Address::generate(&env);
+    let us = String::from_str(&env, "US");
+    env.ledger().with_mut(|l| l.sequence_number = 10);
+    client.add_to_allowlist(&admin, &user, &us, &100);
+    env.ledger().with_mut(|l| l.sequence_number = 101);
+    assert!(!client.is_allowed(&user));
+}
+
 #[test]
 fn test_block_jurisdiction_denies_approved() {
     let (env, client, admin) = setup();

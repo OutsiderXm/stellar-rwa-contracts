@@ -214,6 +214,11 @@ impl ComplianceContract {
             return false;
         }
         let now = env.ledger().sequence();
+        // Boundary semantics (issue #341): `expires_at` is exclusive. A record
+        // is still valid at `expires_at - 1`, and lapses starting exactly at
+        // ledger `expires_at` (i.e. `now >= expires_at` is expired, not
+        // `now > expires_at`). This matches `add_to_allowlist`, which already
+        // rejects `expires_at <= now` as already-expired at creation time.
         if record.expires_at != 0 && now >= record.expires_at {
             // Emit an expiry event so indexers can track the transition (issue #21).
             env.events()
