@@ -399,3 +399,38 @@ fn test_zero_expiry_never_lapses() {
     let rec = client.get_record(&user).unwrap();
     assert_eq!(rec.expires_at, 0);
 }
+
+// ---- issue: get_allowlist_count backed by a maintained counter ----
+
+#[test]
+fn test_allowlist_count_tracks_add_remove_suspend() {
+    let (env, client, admin) = setup();
+    let a = Address::generate(&env);
+    let b = Address::generate(&env);
+    let us = String::from_str(&env, "US");
+
+    assert_eq!(client.get_allowlist_count(), 0);
+
+    client.add_to_allowlist(&admin, &a, &us, &0);
+    assert_eq!(client.get_allowlist_count(), 1);
+
+    client.add_to_allowlist(&admin, &b, &us, &0);
+    assert_eq!(client.get_allowlist_count(), 2);
+
+    // Suspend does not remove the address from the allowlist, so the
+    // maintained counter must not drift.
+    client.suspend(&admin, &a);
+    assert_eq!(client.get_allowlist_count(), 2);
+    assert_eq!(client.get_allowlist_count(), client.get_allowlist().len());
+
+    // Re-approving an existing (suspended) address is not a fresh append.
+    client.add_to_allowlist(&admin, &a, &us, &0);
+    assert_eq!(client.get_allowlist_count(), 2);
+
+    client.remove(&admin, &a);
+    assert_eq!(client.get_allowlist_count(), 1);
+    assert_eq!(client.get_allowlist_count(), client.get_allowlist().len());
+
+    client.remove(&admin, &b);
+    assert_eq!(client.get_allowlist_count(), 0);
+}

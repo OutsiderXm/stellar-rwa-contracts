@@ -67,7 +67,16 @@ Never panics.
 Raw record, or `None`.
 
 ### `get_allowlist() -> Vec<Address>`
-Every address currently on the allowlist.
+Every address currently on the allowlist. Costs scale with the size of the
+list — prefer `get_allowlist_count` when the caller does not need the full
+list.
+
+### `get_allowlist_count() -> u32`
+Number of addresses currently on the allowlist, in O(1). Backed by a
+counter maintained on every append/removal (not a walk over `get_allowlist`),
+so a caller that only needs a count never pays to transfer every address.
+The counter is unaffected by `suspend`, since that does not add or remove
+page membership — it always matches `get_allowlist().len()`.
 
 ### `block_jurisdiction(admin, jurisdiction)` / `unblock_jurisdiction(admin, jurisdiction)`
 Block/unblock an entire country code. Approved addresses in a blocked

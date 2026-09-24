@@ -66,6 +66,10 @@ enum DataKey {
     AllowlistPage(u32),
     /// Which page an address currently lives on, for O(1) removal.
     AllowlistPageOf(Address),
+    /// Maintained counter of addresses currently on the allowlist, kept in
+    /// sync by `append_to_allowlist` / `remove_from_allowlist` so
+    /// `get_allowlist_count` never has to walk any pages.
+    AllowlistCount,
     Record(Address),
     Blocked(String),
 }
@@ -289,6 +293,24 @@ impl ComplianceContract {
         all
     }
 
+    /// Number of addresses currently on the allowlist, in O(1) — backed by a
+    /// maintained counter rather than walking `get_allowlist`'s pages.
+    ///
+    /// The counter is incremented exactly when a brand-new address is
+    /// appended to a page (`append_to_allowlist`, called from
+    /// `add_to_allowlist` the first time an address is seen) and decremented
+    /// exactly when an address is removed from its page
+    /// (`remove_from_allowlist`, called from `remove`). `suspend` only flips
+    /// `KycRecord::status` — the address's page membership (and thus this
+    /// counter) is untouched, which matches `get_allowlist`'s existing
+    /// behaviour of listing suspended addresses too.
+    pub fn get_allowlist_count(env: Env) -> u32 {
+        env.storage()
+            .instance()
+            .get(&DataKey::AllowlistCount)
+            .unwrap_or(0u32)
+    }
+
     /// Block an entire jurisdiction (country code). Approved addresses in a
     /// blocked jurisdiction fail `is_allowed`.
     pub fn block_jurisdiction(env: Env, admin: Address, jurisdiction: String) {
@@ -452,6 +474,15 @@ impl ComplianceContract {
         env.storage()
             .instance()
             .set(&DataKey::AllowlistMeta, &(page_idx, page_len));
+
+        let count: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::AllowlistCount)
+            .unwrap_or(0u32);
+        env.storage()
+            .instance()
+            .set(&DataKey::AllowlistCount, &(count + 1));
     }
 
     /// Remove an address from whichever page it lives on. Leaves the page
@@ -504,6 +535,15 @@ impl ComplianceContract {
         env.storage()
             .persistent()
             .remove(&DataKey::AllowlistPageOf(address.clone()));
+
+        let count: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::AllowlistCount)
+            .unwrap_or(0u32);
+        env.storage()
+            .instance()
+            .set(&DataKey::AllowlistCount, &count.saturating_sub(1));
     }
 }
 
