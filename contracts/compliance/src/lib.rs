@@ -23,6 +23,17 @@ pub enum ComplianceStatus {
     Suspended,
 }
 
+/// One entry of an [`ComplianceContract::add_to_allowlist_batch`] call. Mirrors
+/// the parameters of [`ComplianceContract::add_to_allowlist`] exactly, so each
+/// entry is validated the same way it would be if submitted individually.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AllowlistEntry {
+    pub address: Address,
+    pub jurisdiction: String,
+    pub expires_at: u32,
+}
+
 /// A single KYC record for an address.
 #[contracttype]
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -163,6 +174,74 @@ impl ComplianceContract {
                 was_suspended,
             ),
         );
+    }
+
+    /// Add (or re-approve) several addresses on the KYC allowlist in one
+    /// transaction (issue #338). Each [`AllowlistEntry`] carries its own
+    /// `jurisdiction` and `expires_at`, so every entry is validated and
+    /// normalized exactly as [`Self::add_to_allowlist`] validates a single
+    /// address: same expiry check, same jurisdiction normalization, same
+    /// audit-trail capture, same per-address `approved` event.
+    ///
+    /// If any entry fails validation (e.g. its `expires_at` is in the past,
+    /// or its jurisdiction is malformed), the call panics immediately with
+    /// the same error the single-address path would raise for that entry.
+    /// Soroban rolls back all state changes made earlier in the same
+    /// invocation when it panics, so a failing entry never silently skips
+    /// itself while leaving earlier entries in the batch committed — the
+    /// whole batch either fully applies or fully reverts.
+    pub fn add_to_allowlist_batch(env: Env, admin: Address, entries: Vec<AllowlistEntry>) {
+        Self::require_admin(&env, &admin);
+        let now = env.ledger().sequence();
+
+        for entry in entries.iter() {
+            let address = entry.address;
+            let expires_at = entry.expires_at;
+            if expires_at != 0 && expires_at <= now {
+                panic_with_error(&env, Error::InvalidExpiry);
+            }
+            let jurisdiction = normalize_jurisdiction(&env, &entry.jurisdiction);
+
+            let prev: Option<KycRecord> = env
+                .storage()
+                .persistent()
+                .get(&DataKey::Record(address.clone()));
+
+            let record = KycRecord {
+                address: address.clone(),
+                status: ComplianceStatus::Approved,
+                jurisdiction: jurisdiction.clone(),
+                verified_at: now,
+                expires_at,
+            };
+            env.storage()
+                .persistent()
+                .set(&DataKey::Record(address.clone()), &record);
+
+            if prev.is_none() {
+                Self::append_to_allowlist(&env, &address);
+            }
+
+            let (prev_jurisdiction, prev_expires_at, was_suspended) = match prev {
+                Some(ref r) => (
+                    r.jurisdiction.clone(),
+                    r.expires_at,
+                    r.status == ComplianceStatus::Suspended,
+                ),
+                None => (jurisdiction.clone(), 0u32, false),
+            };
+            env.events().publish(
+                (symbol_short!("approved"), address),
+                (
+                    jurisdiction,
+                    expires_at,
+                    prev_jurisdiction,
+                    prev_expires_at,
+                    was_suspended,
+                ),
+            );
+        }
+        Self::bump_instance(&env);
     }
 
     /// Suspend an approved address. Its record is retained but `is_allowed`

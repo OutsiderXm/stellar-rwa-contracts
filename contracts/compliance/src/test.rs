@@ -423,6 +423,81 @@ fn test_prune_expired_removes_from_allowlist() {
 }
 
 #[test]
+fn test_add_to_allowlist_batch_admits_several_addresses() {
+    // Issue #338: several addresses can be admitted in one transaction, with
+    // the same validation/normalization as the single-address path.
+    let (env, client, admin) = setup();
+    let user_a = Address::generate(&env);
+    let user_b = Address::generate(&env);
+    let us = String::from_str(&env, "us"); // lowercase, mirrors normalize path
+    let ke = String::from_str(&env, "KE");
+    let mut entries: Vec<AllowlistEntry> = Vec::new(&env);
+    entries.push_back(AllowlistEntry {
+        address: user_a.clone(),
+        jurisdiction: us.clone(),
+        expires_at: 0,
+    });
+    entries.push_back(AllowlistEntry {
+        address: user_b.clone(),
+        jurisdiction: ke.clone(),
+        expires_at: 0,
+    });
+
+    client.add_to_allowlist_batch(&admin, &entries);
+
+    assert!(client.is_allowed(&user_a));
+    assert!(client.is_allowed(&user_b));
+    assert_eq!(
+        client.get_record(&user_a).unwrap().jurisdiction,
+        String::from_str(&env, "US")
+    );
+    assert_eq!(client.get_allowlist().len(), 2);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #4)")]
+fn test_add_to_allowlist_batch_partial_failure_reverts_whole_batch() {
+    // Issue #338: a failure in one entry must not silently skip that entry
+    // while committing the others — the whole call reverts.
+    let (env, client, admin) = setup();
+    let user_a = Address::generate(&env);
+    let user_bad = Address::generate(&env);
+    let us = String::from_str(&env, "US");
+    env.ledger().with_mut(|l| l.sequence_number = 500);
+    let mut entries: Vec<AllowlistEntry> = Vec::new(&env);
+    entries.push_back(AllowlistEntry {
+        address: user_a.clone(),
+        jurisdiction: us.clone(),
+        expires_at: 0,
+    });
+    // Second entry has an expiry already in the past: identical to what
+    // add_to_allowlist rejects with Error::InvalidExpiry (#4).
+    entries.push_back(AllowlistEntry {
+        address: user_bad.clone(),
+        jurisdiction: us.clone(),
+        expires_at: 100,
+    });
+
+    client.add_to_allowlist_batch(&admin, &entries);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #5)")]
+fn test_add_to_allowlist_batch_non_admin_rejected() {
+    let (env, client, _admin) = setup();
+    let impostor = Address::generate(&env);
+    let user = Address::generate(&env);
+    let us = String::from_str(&env, "US");
+    let mut entries: Vec<AllowlistEntry> = Vec::new(&env);
+    entries.push_back(AllowlistEntry {
+        address: user,
+        jurisdiction: us,
+        expires_at: 0,
+    });
+    client.add_to_allowlist_batch(&impostor, &entries);
+}
+
+#[test]
 fn test_prune_expired_respects_bound_and_reports_remaining() {
     // Issue #333: prune_expired must accept a bound on how many records a
     // single call processes, and report how many are left to examine.
