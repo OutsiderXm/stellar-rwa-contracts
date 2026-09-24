@@ -90,6 +90,8 @@ pub enum Error {
     InvalidExpiry = 4,
     Unauthorized = 5,
     InvalidJurisdiction = 6,
+    /// `reinstate` was called on an address that is not currently `Suspended`.
+    NotSuspended = 7,
 }
 
 const DAY_IN_LEDGERS: u32 = 17_280; // ~5s ledgers
@@ -197,6 +199,27 @@ impl ComplianceContract {
         Self::bump_instance(&env);
         env.events()
             .publish((symbol_short!("suspend"), address), ());
+    }
+
+    /// Reinstate a `Suspended` address without discarding its original KYC
+    /// metadata. Unlike calling `add_to_allowlist` again (which requires the
+    /// caller to resupply `jurisdiction`/`expires_at` and overwrites
+    /// `verified_at`), `reinstate` flips the status back to `Approved` and
+    /// leaves `jurisdiction`, `verified_at` and `expires_at` untouched.
+    /// Admin only. Errors: `RecordNotFound (#3)`, `NotSuspended (#7)`.
+    pub fn reinstate(env: Env, admin: Address, address: Address) {
+        Self::require_admin(&env, &admin);
+        let mut record = Self::load_record(&env, &address);
+        if record.status != ComplianceStatus::Suspended {
+            panic_with_error(&env, Error::NotSuspended);
+        }
+        record.status = ComplianceStatus::Approved;
+        env.storage()
+            .persistent()
+            .set(&DataKey::Record(address.clone()), &record);
+        Self::bump_instance(&env);
+        env.events()
+            .publish((symbol_short!("reinstat"), address), ());
     }
 
     /// Remove an address entirely from the allowlist.

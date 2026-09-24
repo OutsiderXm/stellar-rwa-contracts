@@ -52,7 +52,16 @@ the past.
 
 ### `suspend(admin, address)`
 Sets an existing record to `Suspended`; `is_allowed` returns `false` until
-re-approved. Admin only. Errors: `RecordNotFound (#3)`, `Unauthorized (#5)`.
+re-approved or reinstated. Admin only. Errors: `RecordNotFound (#3)`,
+`Unauthorized (#5)`.
+
+### `reinstate(admin, address)`
+Restores a `Suspended` record to `Approved` **without discarding its
+original KYC metadata** — `jurisdiction`, `verified_at`, and `expires_at`
+are left untouched, unlike calling `add_to_allowlist` again (which requires
+resupplying those fields and overwrites `verified_at`). Admin only.
+Errors: `RecordNotFound (#3)`, `NotSuspended (#7)` if the record is not
+currently `Suspended`.
 
 ### `remove(admin, address)`
 Deletes a record and removes the address from the allowlist. Admin only.
@@ -97,6 +106,7 @@ The configured admin. Errors: `NotInitialized (#2)`.
 | 3    | RecordNotFound      | Operating on a missing record           |
 | 4    | InvalidExpiry       | `expires_at` already in the past        |
 | 5    | Unauthorized        | Caller is not the stored admin          |
+| 7    | NotSuspended        | `reinstate` called on a non-`Suspended` record |
 
 ## Events
 
@@ -105,6 +115,7 @@ The configured admin. Errors: `NotInitialized (#2)`.
 | `init`       | admin address                 | on initialize              |
 | `approved`   | (address) → (jurisdiction, expires_at) | address approved  |
 | `suspend`    | (address)                     | address suspended          |
+| `reinstat`   | (address)                     | suspended address reinstated |
 | `removed`    | (address)                     | address removed            |
 | `blockjur`   | jurisdiction                  | jurisdiction blocked       |
 | `unblkjur`   | jurisdiction                  | jurisdiction unblocked     |

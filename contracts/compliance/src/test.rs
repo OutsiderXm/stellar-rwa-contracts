@@ -434,3 +434,49 @@ fn test_allowlist_count_tracks_add_remove_suspend() {
     client.remove(&admin, &b);
     assert_eq!(client.get_allowlist_count(), 0);
 }
+
+// ---- issue: reinstate a suspended address preserving KYC metadata ----
+
+#[test]
+fn test_reinstate_preserves_jurisdiction_and_verified_at() {
+    let (env, client, admin) = setup();
+    let user = Address::generate(&env);
+    let ke = String::from_str(&env, "KE");
+
+    env.ledger().with_mut(|l| l.sequence_number = 50);
+    client.add_to_allowlist(&admin, &user, &ke, &0);
+    let original = client.get_record(&user).unwrap();
+
+    env.ledger().with_mut(|l| l.sequence_number = 60);
+    client.suspend(&admin, &user);
+    assert!(!client.is_allowed(&user));
+    assert_eq!(client.status_of(&user), Some(ComplianceStatus::Suspended));
+
+    env.ledger().with_mut(|l| l.sequence_number = 70);
+    client.reinstate(&admin, &user);
+
+    assert!(client.is_allowed(&user));
+    let reinstated = client.get_record(&user).unwrap();
+    assert_eq!(reinstated.status, ComplianceStatus::Approved);
+    assert_eq!(reinstated.jurisdiction, original.jurisdiction);
+    assert_eq!(reinstated.verified_at, original.verified_at);
+    assert_eq!(reinstated.expires_at, original.expires_at);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #7)")]
+fn test_reinstate_non_suspended_rejected() {
+    let (env, client, admin) = setup();
+    let user = Address::generate(&env);
+    let us = String::from_str(&env, "US");
+    client.add_to_allowlist(&admin, &user, &us, &0);
+    client.reinstate(&admin, &user);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #3)")]
+fn test_reinstate_missing_record_rejected() {
+    let (env, client, admin) = setup();
+    let ghost = Address::generate(&env);
+    client.reinstate(&admin, &ghost);
+}
