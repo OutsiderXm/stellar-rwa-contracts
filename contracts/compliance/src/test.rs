@@ -480,3 +480,45 @@ fn test_reinstate_missing_record_rejected() {
     let ghost = Address::generate(&env);
     client.reinstate(&admin, &ghost);
 }
+
+// ---- issue: paginated allowlist listing ----
+
+#[test]
+fn test_get_allowlist_page_offset_and_limit() {
+    let (env, client, admin) = setup();
+    let us = String::from_str(&env, "US");
+    let mut addrs: Vec<Address> = Vec::new(&env);
+    for _ in 0..5 {
+        let a = Address::generate(&env);
+        client.add_to_allowlist(&admin, &a, &us, &0);
+        addrs.push_back(a);
+    }
+
+    let page1 = client.get_allowlist_page(&0, &2);
+    assert_eq!(page1.len(), 2);
+    let page2 = client.get_allowlist_page(&2, &2);
+    assert_eq!(page2.len(), 2);
+    // Final partial page.
+    let page3 = client.get_allowlist_page(&4, &2);
+    assert_eq!(page3.len(), 1);
+    assert_eq!(page3.get(0).unwrap(), addrs.get(4).unwrap());
+
+    // Past the end returns empty.
+    let page4 = client.get_allowlist_page(&5, &2);
+    assert_eq!(page4.len(), 0);
+}
+
+#[test]
+fn test_get_allowlist_page_limit_clamped_to_max() {
+    let (env, client, admin) = setup();
+    let us = String::from_str(&env, "US");
+    let a = Address::generate(&env);
+    client.add_to_allowlist(&admin, &a, &us, &0);
+
+    // limit=0 and an oversized limit both clamp to MAX_ALLOWLIST_PAGE_SIZE,
+    // which is still satisfied by whatever is actually on the allowlist.
+    let via_zero = client.get_allowlist_page(&0, &0);
+    let via_huge = client.get_allowlist_page(&0, &(MAX_ALLOWLIST_PAGE_SIZE + 1000));
+    assert_eq!(via_zero.len(), 1);
+    assert_eq!(via_huge.len(), 1);
+}

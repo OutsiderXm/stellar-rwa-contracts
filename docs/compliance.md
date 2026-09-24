@@ -87,6 +87,13 @@ so a caller that only needs a count never pays to transfer every address.
 The counter is unaffected by `suspend`, since that does not add or remove
 page membership — it always matches `get_allowlist().len()`.
 
+### `get_allowlist_page(offset: u32, limit: u32) -> Vec<Address>`
+Pages through the allowlist. `offset` skips that many addresses from the
+start; `limit` is clamped to `MAX_ALLOWLIST_PAGE_SIZE` (200) — pass `0` or
+anything above the max to get the max page size back. An `offset` at or past
+the end of the list returns an empty `Vec`, which signals the final page has
+already been consumed.
+
 ### `block_jurisdiction(admin, jurisdiction)` / `unblock_jurisdiction(admin, jurisdiction)`
 Block/unblock an entire country code. Approved addresses in a blocked
 jurisdiction fail `is_allowed`. Admin only.

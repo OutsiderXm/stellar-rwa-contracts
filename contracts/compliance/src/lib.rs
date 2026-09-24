@@ -78,6 +78,12 @@ enum DataKey {
 /// storage entry regardless of how large the KYC list grows.
 const ALLOWLIST_PAGE_SIZE: u32 = 200;
 
+/// Maximum number of addresses `get_allowlist_page` will return in a single
+/// call, regardless of the requested `limit`. Callers that pass `0` or a
+/// value greater than this get back exactly this many entries (or fewer, on
+/// the final partial page).
+pub const MAX_ALLOWLIST_PAGE_SIZE: u32 = 200;
+
 /// Typed contract errors. Signalled via `panic_with_error!`, which produces a
 /// deterministic contract error (not an unhandled host panic).
 #[contracterror]
@@ -332,6 +338,49 @@ impl ComplianceContract {
             .instance()
             .get(&DataKey::AllowlistCount)
             .unwrap_or(0u32)
+    }
+
+    /// Page through the allowlist without transferring the whole list.
+    ///
+    /// `offset` is the number of addresses to skip from the start of the
+    /// allowlist; `limit` is the maximum number of addresses to return.
+    /// `limit` is clamped to [`MAX_ALLOWLIST_PAGE_SIZE`] — passing `0` or a
+    /// value above the maximum returns up to the maximum page size. Passing
+    /// an `offset` at or beyond the end of the list returns an empty `Vec`,
+    /// which is how callers detect the final page.
+    pub fn get_allowlist_page(env: Env, offset: u32, limit: u32) -> Vec<Address> {
+        let limit = if limit == 0 || limit > MAX_ALLOWLIST_PAGE_SIZE {
+            MAX_ALLOWLIST_PAGE_SIZE
+        } else {
+            limit
+        };
+        let mut result = Vec::new(&env);
+        let mut skipped: u32 = 0;
+        let (current_page, _) = Self::allowlist_meta(&env);
+        for page_idx in 0..=current_page {
+            if result.len() as u32 >= limit {
+                break;
+            }
+            let page: Option<Vec<Address>> = env
+                .storage()
+                .persistent()
+                .get(&DataKey::AllowlistPage(page_idx));
+            let page = match page {
+                Some(p) if !p.is_empty() => p,
+                _ => continue,
+            };
+            for a in page.iter() {
+                if skipped < offset {
+                    skipped += 1;
+                    continue;
+                }
+                if result.len() as u32 >= limit {
+                    break;
+                }
+                result.push_back(a);
+            }
+        }
+        result
     }
 
     /// Block an entire jurisdiction (country code). Approved addresses in a
