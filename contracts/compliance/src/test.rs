@@ -406,8 +406,11 @@ fn test_prune_expired_removes_from_allowlist() {
     assert!(!client.is_allowed(&user_expire));
     assert!(client.is_allowed(&user_persist));
 
-    // Prune expired records
-    client.prune_expired(&admin);
+    // Prune expired records. max_records = 0 means unbounded, matching the
+    // pre-#333 behaviour for a small allowlist: a single call finishes the
+    // whole pass and reports 0 remaining.
+    let remaining = client.prune_expired(&admin, &0);
+    assert_eq!(remaining, 0);
 
     // Verify get_allowlist no longer contains the expired user
     let list = client.get_allowlist();
@@ -417,4 +420,37 @@ fn test_prune_expired_removes_from_allowlist() {
     // Verify get_record returns None for the pruned user
     assert!(client.get_record(&user_expire).is_none());
     assert!(client.get_record(&user_persist).is_some());
+}
+
+#[test]
+fn test_prune_expired_respects_bound_and_reports_remaining() {
+    // Issue #333: prune_expired must accept a bound on how many records a
+    // single call processes, and report how many are left to examine.
+    let (env, client, admin) = setup();
+    let us = String::from_str(&env, "US");
+    let mut users: Vec<Address> = Vec::new(&env);
+    for _ in 0..5 {
+        users.push_back(Address::generate(&env));
+    }
+    env.ledger().with_mut(|l| l.sequence_number = 10);
+    for u in users.iter() {
+        client.add_to_allowlist(&admin, &u, &us, &100);
+    }
+    env.ledger().with_mut(|l| l.sequence_number = 101);
+    assert_eq!(client.get_allowlist().len(), 5);
+
+    // First call only examines 2 of the 5 expired entries.
+    let remaining = client.prune_expired(&admin, &2);
+    assert_eq!(remaining, 3);
+    assert_eq!(client.get_allowlist().len(), 3);
+
+    // Second call examines the rest.
+    let remaining = client.prune_expired(&admin, &2);
+    assert_eq!(remaining, 1);
+    assert_eq!(client.get_allowlist().len(), 1);
+
+    // Final call clears the last one; nothing left to examine.
+    let remaining = client.prune_expired(&admin, &2);
+    assert_eq!(remaining, 0);
+    assert_eq!(client.get_allowlist().len(), 0);
 }

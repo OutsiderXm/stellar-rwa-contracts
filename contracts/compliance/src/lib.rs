@@ -312,17 +312,29 @@ impl ComplianceContract {
             .unwrap_or(false)
     }
 
-    /// Prune all expired records from the allowlist. Admin only (issue #21).
+    /// Prune expired records from the allowlist. Admin only (issue #21).
     /// Removes expired entries from persistent storage and the allowlist vector
     /// so indexers and `get_allowlist` no longer count them as Approved.
     ///
     /// Issue #306: previously iterated every allocated page unconditionally.
     /// We now skip absent or already-empty pages so cost scales with live
     /// pages, not historical page count.
-    pub fn prune_expired(env: Env, admin: Address) {
+    ///
+    /// Issue #333: a single invocation can still exceed host resource limits
+    /// once the allowlist is large enough, since the whole thing was scanned
+    /// in one call regardless of size. `max_records` bounds how many
+    /// individual allowlist entries this call will inspect before returning,
+    /// so a large allowlist can be pruned incrementally across several
+    /// transactions. Passing `0` means "no bound" (scan everything), which
+    /// preserves prior behaviour for small allowlists. The return value is
+    /// the number of entries left unexamined (i.e. still possibly expired
+    /// and not yet checked) once the bound is hit, so callers know whether
+    /// to invoke again; it is `0` once a full pass completes.
+    pub fn prune_expired(env: Env, admin: Address, max_records: u32) -> u32 {
         Self::require_admin(&env, &admin);
         let now = env.ledger().sequence();
         let (current_page, _) = Self::allowlist_meta(&env);
+        let mut examined: u32 = 0;
         for page_idx in 0..=current_page {
             let page: Option<Vec<Address>> = env
                 .storage()
@@ -334,7 +346,18 @@ impl ComplianceContract {
             };
             let mut next = Vec::new(&env);
             let mut changed = false;
+            let mut stopped_early = false;
+            let mut unexamined_in_page: u32 = 0;
             for addr in page.iter() {
+                if max_records != 0 && examined >= max_records {
+                    // Bound reached: keep this and every remaining entry in
+                    // the page untouched, to be examined on a later call.
+                    next.push_back(addr);
+                    stopped_early = true;
+                    unexamined_in_page += 1;
+                    continue;
+                }
+                examined += 1;
                 let record: Option<KycRecord> = env
                     .storage()
                     .persistent()
@@ -368,8 +391,25 @@ impl ComplianceContract {
                     .persistent()
                     .set(&DataKey::AllowlistPage(page_idx), &next);
             }
+            if stopped_early {
+                // Entries left unexamined in this page, plus every entry on
+                // pages not yet visited at all.
+                let mut total_remaining = unexamined_in_page;
+                for later_idx in (page_idx + 1)..=current_page {
+                    let later: Option<Vec<Address>> = env
+                        .storage()
+                        .persistent()
+                        .get(&DataKey::AllowlistPage(later_idx));
+                    if let Some(p) = later {
+                        total_remaining += p.len();
+                    }
+                }
+                Self::bump_instance(&env);
+                return total_remaining;
+            }
         }
         Self::bump_instance(&env);
+        0
     }
 
     /// Return the configured admin address.
