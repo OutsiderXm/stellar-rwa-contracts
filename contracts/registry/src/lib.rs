@@ -289,6 +289,54 @@ impl RegistryContract {
             .publish((symbol_short!("deactvate"),), asset_id);
     }
 
+    /// Update an asset's valuation. Admin only. Adjusts total value locked
+    /// accordingly (only while the asset is `active`) and emits a
+    /// `valuation` event carrying the asset id and both the old and new
+    /// valuations, so indexers can observe the change without polling
+    /// (issue #3).
+    pub fn update_valuation(env: Env, admin: Address, asset_id: u64, new_valuation: i128) {
+        Self::require_admin(&env, &admin);
+        if new_valuation < 0 {
+            panic_err(&env, Error::InvalidValuation);
+        }
+        let mut entry: AssetEntry = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Asset(asset_id))
+            .unwrap_or_else(|| panic_err(&env, Error::AssetNotFound));
+        let old_valuation = entry.valuation;
+        entry.valuation = new_valuation;
+        env.storage()
+            .persistent()
+            .set(&DataKey::Asset(asset_id), &entry);
+        env.storage().persistent().extend_ttl(
+            &DataKey::Asset(asset_id),
+            INSTANCE_LIFETIME_THRESHOLD,
+            INSTANCE_BUMP_AMOUNT,
+        );
+
+        if entry.active {
+            let tvl: i128 = env
+                .storage()
+                .instance()
+                .get(&DataKey::TotalValuation)
+                .unwrap_or(0);
+            let new_tvl = tvl
+                .checked_sub(old_valuation)
+                .and_then(|v| v.checked_add(new_valuation))
+                .unwrap_or_else(|| panic_err(&env, Error::Overflow));
+            env.storage()
+                .instance()
+                .set(&DataKey::TotalValuation, &new_tvl);
+        }
+
+        bump(&env);
+        env.events().publish(
+            (symbol_short!("valuation"), asset_id),
+            (old_valuation, new_valuation),
+        );
+    }
+
     /// Sum of valuations across all active assets, in USD cents. Maintained
     /// incrementally on register/deactivate, so this is a single read
     /// regardless of registry size.

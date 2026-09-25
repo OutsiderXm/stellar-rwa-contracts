@@ -29,6 +29,10 @@ and reports total value locked (TVL).
 - `get_assets_by_type(asset_type) -> Vec<AssetEntry>`
 - `get_all_assets() -> Vec<AssetEntry>`
 - `deactivate_asset(admin, asset_id)` — admin auth; sets `active=false`.
+- `update_valuation(admin, asset_id, new_valuation)` — admin auth; updates
+  `AssetEntry.valuation`, adjusts TVL if the asset is `active`, and emits a
+  `valuation` event (see Events below) so indexers observe the change without
+  polling. `InvalidValuation (#5)` if negative; `AssetNotFound (#4)`.
 - `total_value_locked() -> i128` — sum of `valuation` over active assets.
 - `asset_count() -> u64`
 - `get_admin() -> Address`
@@ -50,6 +54,7 @@ and reports total value locked (TVL).
 | `init`      | admin             | initialize        |
 | `register`  | (issuer) → id     | asset registered  |
 | `deactvate` | asset_id          | asset deactivated |
+| `valuation` | (asset_id) → (old_valuation, new_valuation) | valuation changed via `update_valuation` (issue #3) |
 
 ## Storage / TTL
 
