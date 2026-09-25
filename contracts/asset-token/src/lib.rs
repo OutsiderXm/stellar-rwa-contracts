@@ -223,8 +223,23 @@ impl AssetTokenContract {
     }
 
     /// Batch-mint to multiple compliance-approved recipients in a single call.
-    /// Admin only. Each `(recipient, amount)` pair is checked individually;
-    /// if any recipient fails compliance the entire call reverts.
+    /// Admin only.
+    ///
+    /// # Atomicity (all-or-nothing)
+    ///
+    /// `mint_batch` is atomic across the whole `recipients` vector: pairs are
+    /// checked and applied in order, but nothing is durably committed until
+    /// every pair has passed. If any recipient fails compliance (or any
+    /// amount is invalid, or the running supply would overflow), the
+    /// function panics and the host reverts *all* state changes from this
+    /// call — balances already "credited" earlier in the loop, the total
+    /// supply, and any `mint` events already published are rolled back as if
+    /// the call never happened. Callers can rely on this: there is no
+    /// partial-mint outcome to reconcile. A caller who wants "mint what
+    /// compliance allows and skip the rest" must pre-filter `recipients`
+    /// themselves (e.g. via `status_of`/`is_allowed` on the compliance
+    /// contract) before calling `mint_batch`; this contract does not offer a
+    /// best-effort mode.
     pub fn mint_batch(env: Env, admin: Address, recipients: Vec<(Address, i128)>) {
         let mut meta = Self::require_admin(&env, &admin);
         if meta.paused {
