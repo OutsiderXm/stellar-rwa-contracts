@@ -29,7 +29,9 @@ pub enum ComplianceStatus {
 pub struct KycRecord {
     pub address: Address,
     pub status: ComplianceStatus,
-    /// ISO country code, e.g. "US", "KE", "DE".
+    /// Canonical ISO-3166-1 alpha-2 country code, e.g. "US", "KE", "DE".
+    /// Always exactly 2 uppercase ASCII letters; see [`normalize_jurisdiction`]
+    /// for the enforced canonical form.
     pub jurisdiction: String,
     /// Ledger sequence at which the record was verified.
     pub verified_at: u32,

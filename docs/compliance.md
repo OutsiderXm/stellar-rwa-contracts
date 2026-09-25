@@ -25,11 +25,28 @@ pass `is_allowed`.
 |---------------|-------------------|-----------------------------------------------------|
 | `address`     | `Address`         | The account this record applies to                  |
 | `status`      | `ComplianceStatus`| Approval state                                      |
-| `jurisdiction`| `String`          | ISO country code, e.g. `"US"`                       |
+| `jurisdiction`| `String`          | Canonical ISO-3166-1 alpha-2 country code, e.g. `"US"` |
 | `verified_at` | `u32`             | Ledger sequence at verification                     |
 | `expires_at`  | `u32`             | Ledger sequence of expiry; `0` = never expires      |
 
 > Time is measured in **ledger sequence numbers**, not calendar dates.
+
+### Jurisdiction canonical form
+
+To prevent "USA", "us", and "US" from being silently treated as three
+different jurisdictions, every jurisdiction string passed to
+`add_to_allowlist`, `block_jurisdiction`, `unblock_jurisdiction`, and
+`is_jurisdiction_blocked` is normalized and validated before use:
+
+- Interior/leading/trailing ASCII spaces are stripped.
+- Letters are upper-cased.
+- The result **must** be exactly 2 ASCII alphabetic characters (a real
+  ISO-3166-1 alpha-2 code such as `US`, `KE`, `DE`).
+
+Anything else — 1 or 3+ letters, digits, punctuation, or an empty string —
+panics with `InvalidJurisdiction (#6)`. Stored records and blocked-jurisdiction
+keys always hold the canonical 2-letter uppercase form, so lookups by any
+casing/whitespace variant of the same code resolve to the same jurisdiction.
 
 ## Functions
 
@@ -81,6 +98,7 @@ The configured admin. Errors: `NotInitialized (#2)`.
 | 3    | RecordNotFound      | Operating on a missing record           |
 | 4    | InvalidExpiry       | `expires_at` already in the past        |
 | 5    | Unauthorized        | Caller is not the stored admin          |
+| 6    | InvalidJurisdiction | Jurisdiction is not 2 ASCII letters after normalization |
 
 ## Events
 
