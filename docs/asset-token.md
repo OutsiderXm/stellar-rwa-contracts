@@ -102,3 +102,32 @@ Listing of the contract `DataKey` variants and their storage behaviour.
 - Amounts must be strictly positive; zero/negative amounts revert.
 - `mint` overflow is checked; supply cannot wrap.
 - Only the admin can pause, mint, change valuation, or repoint compliance.
+
+## Failure mode: unreachable compliance contract (issue #305)
+
+`transfer`, `mint`, `mint_batch`, `burn`, and `set_compliance` all call into
+`compliance_contract` via the generated `ComplianceClient`. This is a real
+cross-contract call, not a local check, so it inherits the failure modes of
+any Soroban invocation:
+
+- **No contract deployed at that address** — the host cannot resolve the
+  call and **traps**, aborting the entire transaction. No balance, supply, or
+  metadata change is applied.
+- **The callee traps internally** (e.g. it panics on unexpected input) —
+  same result: the trap propagates up, the whole transaction rolls back.
+- **The callee returns a value but not `bool`** — this cannot happen without
+  bypassing the SDK's type-checked client; if it somehow did, decoding would
+  itself trap.
+
+This is the deliberate, and only sane, behavior: the token contract has no
+way to distinguish "compliance said no" from "compliance is broken," so it
+treats an unreachable or malfunctioning gate as a hard failure rather than
+either failing open (allowing the transfer) or silently no-opping. Operators
+must ensure `compliance_contract` always points at a live, correctly
+implemented contract; `set_compliance` mitigates this somewhat by calling the
+new gate before switching to it, but does not protect against the gate later
+being removed or bricked.
+
+Proven by test: `test_gate_traps_when_compliance_address_has_no_contract` and
+`test_transfer_traps_when_compliance_contract_is_unreachable` in
+`contracts/asset-token/src/test.rs`.

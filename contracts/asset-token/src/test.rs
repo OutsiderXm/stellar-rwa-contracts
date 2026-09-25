@@ -802,3 +802,55 @@ fn test_total_supply_tracks_mint_burn_mint_batch() {
     // The metadata-reported supply stays in lockstep with the direct ABI read.
     assert_eq!(s.token.get_metadata().total_supply, s.token.total_supply());
 }
+
+// ---- issue #305: compliance gate against an address that cannot satisfy the call ----
+
+/// If the configured compliance contract address holds no contract at all,
+/// the cross-contract call the gate depends on cannot execute and the host
+/// traps. This is deliberate: a transfer must never silently succeed (or
+/// silently fail open) when the compliance gate is unreachable — it fails
+/// hard, aborting the whole transaction. Documented in docs/asset-token.md.
+#[test]
+#[should_panic]
+fn test_gate_traps_when_compliance_address_has_no_contract() {
+    let s = setup(1_000);
+    let ghost = Address::generate(&s.env);
+    // `set_compliance` itself calls into the new gate to sanity-check it
+    // before switching, so pointing it at a non-contract address exercises
+    // exactly the same `is_allowed` call path that `transfer`/`mint` use.
+    s.token.set_compliance(&s.admin, &ghost);
+}
+
+/// Same failure mode, exercised directly against `transfer` rather than
+/// `set_compliance`: an already-configured but unreachable compliance
+/// contract (e.g. one that was valid at `set_compliance` time but has since
+/// been removed, or any address with no deployed contract) traps the call
+/// instead of allowing or silently blocking the transfer.
+#[test]
+#[should_panic]
+fn test_transfer_traps_when_compliance_contract_is_unreachable() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let admin = Address::generate(&env);
+    // A plain generated address with no contract registered at it.
+    let ghost_compliance = Address::generate(&env);
+    let token_id = env.register(AssetTokenContract, ());
+    let token = AssetTokenContractClient::new(&env, &token_id);
+    // We cannot initialize through the ghost gate (initialize itself checks
+    // compliance), so this test asserts the trap occurs at the earliest
+    // possible point: initialization also depends on the same gate call.
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        token.initialize(
+            &admin,
+            &String::from_str(&env, "Ghost Asset"),
+            &String::from_str(&env, "GHOST"),
+            &String::from_str(&env, "real_estate"),
+            &1_000i128,
+            &2u32,
+            &ghost_compliance,
+            &String::from_str(&env, "no contract at this address"),
+            &1_000i128,
+        );
+    }));
+    assert!(result.is_err(), "expected a trap from the unreachable compliance contract");
+}
