@@ -381,3 +381,64 @@ fn test_prune_expired_removes_from_allowlist() {
     assert!(client.get_record(&user_expire).is_none());
     assert!(client.get_record(&user_persist).is_some());
 }
+
+// ---- issue: is_allowed must explicitly reject every non-Approved status ----
+
+#[test]
+fn test_is_allowed_rejects_pending_status() {
+    // `Pending` has no public setter today, so we write the record directly
+    // via storage (as a future KYC-submission workflow would) and assert
+    // `is_allowed` still rejects it, not just "no record found".
+    let (env, client, _admin) = setup();
+    let user = Address::generate(&env);
+    let us = String::from_str(&env, "US");
+    env.as_contract(&client.address, || {
+        env.storage().persistent().set(
+            &DataKey::Record(user.clone()),
+            &KycRecord {
+                address: user.clone(),
+                status: ComplianceStatus::Pending,
+                jurisdiction: us,
+                verified_at: 0,
+                expires_at: 0,
+            },
+        );
+    });
+    assert_eq!(client.status_of(&user), Some(ComplianceStatus::Pending));
+    assert!(!client.is_allowed(&user));
+}
+
+#[test]
+fn test_is_allowed_rejects_rejected_status() {
+    let (env, client, _admin) = setup();
+    let user = Address::generate(&env);
+    let us = String::from_str(&env, "US");
+    env.as_contract(&client.address, || {
+        env.storage().persistent().set(
+            &DataKey::Record(user.clone()),
+            &KycRecord {
+                address: user.clone(),
+                status: ComplianceStatus::Rejected,
+                jurisdiction: us,
+                verified_at: 0,
+                expires_at: 0,
+            },
+        );
+    });
+    assert_eq!(client.status_of(&user), Some(ComplianceStatus::Rejected));
+    assert!(!client.is_allowed(&user));
+}
+
+#[test]
+fn test_is_allowed_rejects_suspended_status() {
+    // Suspended is already exercised via `test_suspend_blocks_transfer`, but
+    // this asserts it alongside its Pending/Rejected siblings so all three
+    // non-Approved statuses are covered by name, not just generically.
+    let (env, client, admin) = setup();
+    let user = Address::generate(&env);
+    let us = String::from_str(&env, "US");
+    client.add_to_allowlist(&admin, &user, &us, &0);
+    client.suspend(&admin, &user);
+    assert_eq!(client.status_of(&user), Some(ComplianceStatus::Suspended));
+    assert!(!client.is_allowed(&user));
+}
