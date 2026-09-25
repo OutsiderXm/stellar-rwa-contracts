@@ -17,6 +17,20 @@ claimable = total_amount * balance(holder) / total_supply
 where `balance` and `total_supply` are read live from the asset token. Integer
 division floors the result. Each holder can claim a given distribution **once**.
 
+### Rounding & dust (issue #4)
+
+Flooring means each holder's payout can fall short of their exact
+proportional share by a fractional remainder. These losses accumulate rather
+than cancel. For `N` eligible holders, the total dust left stranded in
+escrow after everyone claims is bounded by `0 <= dust <= N - 1` units of
+`payment_token` (derived from `sum(total_amount * balance_i / supply) =
+total_amount` exactly, so the sum of the `N` per-holder fractional losses is
+< `N`, and — being an integer — is at most `N - 1`). This is expected,
+documented behaviour: rounding some holder up instead would let total claims
+exceed `total_amount`. See `reclaim_unclaimed` for the only mechanism that
+can recover stranded funds (requires a `deadline`), and
+`test_uneven_distribution_leaves_dust` in `test.rs` for a worked example.
+
 ## `Distribution`
 
 | Field            | Type      | Meaning                              |

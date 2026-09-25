@@ -304,6 +304,37 @@ impl DividendContract {
 
     /// Amount a holder can still claim from a distribution (0 if already
     /// claimed, holds nothing, or the distribution is empty).
+    ///
+    /// # Rounding behaviour & dust (issue #4)
+    ///
+    /// Each claim is `floor(total_amount * balance_i / supply)`: integer
+    /// division truncates toward zero, so a holder's actual payout can be up
+    /// to (but never more than) `1` unit of `payment_token` less than their
+    /// exact proportional share. Because every holder's share is computed
+    /// independently, these per-holder rounding losses do **not** cancel out
+    /// — they only ever accumulate.
+    ///
+    /// **Worst-case dust, quantified:** let `N` be the number of entries in
+    /// the `eligible` snapshot. Writing each exact share as
+    /// `a_i = total_amount * balance_i / supply` (a real number), we have
+    /// `sum(a_i) = total_amount` exactly (since `sum(balance_i) = supply`).
+    /// The permanently-unclaimable dust is `total_amount - sum(floor(a_i))
+    /// = sum(frac(a_i))`, a sum of `N` fractional terms each in `[0, 1)`.
+    /// That sum is therefore strictly less than `N` and, being an integer
+    /// (both `total_amount` and the floored sum are integers), satisfies
+    /// `0 <= dust <= N - 1`. In other words: **at most one unit of
+    /// `payment_token` per eligible holder can be left stranded in escrow**,
+    /// and this bound is tight (achievable when every holder's remainder is
+    /// `supply - 1`). This dust is never reclaimed by `claim`/`claimable`;
+    /// see `reclaim_unclaimed` (issue #2) for the only way an admin can
+    /// recover it, and once a deadline is set.
+    ///
+    /// This is documented, expected behaviour, not a bug: exact proportional
+    /// division is generally impossible over integers, and the alternative
+    /// (rounding some holders up) would let claims collectively exceed
+    /// `total_amount`, violating the escrow invariant enforced by
+    /// `OverDistributed`. See `test::test_uneven_distribution_leaves_dust` in
+    /// `test.rs` for a worked example.
     pub fn claimable(env: Env, distribution_id: u64, holder: Address) -> i128 {
         let dist = Self::load(&env, distribution_id);
         if Self::has_claimed(env.clone(), distribution_id, holder.clone()) {

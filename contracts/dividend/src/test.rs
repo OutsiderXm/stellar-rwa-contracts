@@ -937,3 +937,47 @@ fn test_reclaim_without_deadline_fails() {
     set_ledger_sequence(&ctx.env, ctx.env.ledger().sequence() + 1_000_000);
     ctx.dividend.reclaim_unclaimed(&ctx.admin, &id);
 }
+
+// ---- issue #4: integer-division rounding leaves dust ----
+
+// A distribution that does not divide evenly among its 3 holders leaves
+// dust permanently locked in escrow. Worst-case dust for N=3 holders is
+// N-1 = 2 units (see the module doc on `claimable`); this picks amounts
+// designed to hit that bound.
+#[test]
+fn test_uneven_distribution_leaves_dust() {
+    let ctx = setup();
+    let div_addr = ctx.dividend.address.clone();
+    // supply = 1000 (300 + 200 + 500), total_amount = 1001 does not divide
+    // evenly by any of the three balances.
+    let total_amount = 1001i128;
+    let id = ctx.dividend.create_distribution(
+        &ctx.admin,
+        &ctx.asset_id,
+        &ctx.pay_id,
+        &total_amount,
+        &eligible(&ctx),
+    );
+
+    let c_h1 = ctx.dividend.claimable(&id, &ctx.h1); // floor(1001*300/1000) = 300
+    let c_h2 = ctx.dividend.claimable(&id, &ctx.h2); // floor(1001*200/1000) = 200
+    let c_admin = ctx.dividend.claimable(&id, &ctx.admin); // floor(1001*500/1000) = 500
+    assert_eq!(c_h1, 300);
+    assert_eq!(c_h2, 200);
+    assert_eq!(c_admin, 500);
+
+    ctx.dividend.claim(&id, &ctx.h1);
+    ctx.dividend.claim(&id, &ctx.h2);
+    ctx.dividend.claim(&id, &ctx.admin);
+
+    let d = ctx.dividend.get_distribution(&id);
+    let dust = total_amount - d.distributed;
+    // dust must obey the documented bound: 0 <= dust <= N - 1 (N=3 holders).
+    assert!(dust >= 0 && dust <= 2);
+    assert_eq!(dust, 1); // 1001 - (300 + 200 + 500)
+
+    // The dust remains stranded in the contract's escrow: nothing further
+    // can be claimed (distribution is exhausted / no deadline to reclaim).
+    assert_eq!(pay_balance(&ctx, &div_addr), dust);
+    assert!(!d.completed); // distributed (1000) < total_amount (1001)
+}
