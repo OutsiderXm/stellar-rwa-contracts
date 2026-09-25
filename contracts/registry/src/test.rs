@@ -460,6 +460,42 @@ fn test_reactivate_unknown_id_fails() {
 }
 
 #[test]
+fn test_tvl_running_total_matches_full_recomputation() {
+    // TVL must stay O(1) to read while remaining correct across every
+    // mutation. Prove the running total always equals a brute-force
+    // recomputation over every asset (active only) via get_all_assets.
+    let (env, client, admin) = setup();
+    let issuer = Address::generate(&env);
+    let a = register(&env, &client, &issuer, "real_estate", 100);
+    let b = register(&env, &client, &issuer, "invoice", 250);
+    let c = register(&env, &client, &issuer, "commodity", 75);
+
+    let recompute = |client: &RegistryContractClient| -> i128 {
+        client
+            .get_all_assets(&0, &1000)
+            .iter()
+            .filter(|e| e.active)
+            .map(|e| e.valuation)
+            .sum()
+    };
+
+    assert_eq!(client.total_value_locked(), recompute(&client));
+
+    client.deactivate_asset(&admin, &b);
+    assert_eq!(client.total_value_locked(), recompute(&client));
+
+    client.reactivate_asset(&admin, &b);
+    assert_eq!(client.total_value_locked(), recompute(&client));
+
+    client.deactivate_asset(&admin, &a);
+    client.deactivate_asset(&admin, &c);
+    assert_eq!(client.total_value_locked(), recompute(&client));
+
+    client.reactivate_asset(&admin, &a);
+    assert_eq!(client.total_value_locked(), recompute(&client));
+}
+
+#[test]
 #[should_panic(expected = "Error(Contract, #7)")]
 fn test_register_rejects_asset_type_with_whitespace() {
     // A padded variant of a valid type must still be rejected at
