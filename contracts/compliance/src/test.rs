@@ -442,3 +442,34 @@ fn test_is_allowed_rejects_suspended_status() {
     assert_eq!(client.status_of(&user), Some(ComplianceStatus::Suspended));
     assert!(!client.is_allowed(&user));
 }
+
+// ---- issue: expose the blocked-jurisdiction set as a direct read ----
+
+#[test]
+fn test_get_blocked_jurisdictions_round_trip() {
+    let (env, client, admin) = setup();
+    let ir = String::from_str(&env, "IR");
+    let kp = String::from_str(&env, "KP");
+
+    assert_eq!(client.get_blocked_jurisdictions().len(), 0);
+
+    client.block_jurisdiction(&admin, &ir);
+    let after_first = client.get_blocked_jurisdictions();
+    assert_eq!(after_first.len(), 1);
+    assert_eq!(after_first.get(0).unwrap(), ir);
+
+    client.block_jurisdiction(&admin, &kp);
+    let after_second = client.get_blocked_jurisdictions();
+    assert_eq!(after_second.len(), 2);
+
+    // Blocking an already-blocked jurisdiction again must not duplicate it.
+    client.block_jurisdiction(&admin, &ir);
+    assert_eq!(client.get_blocked_jurisdictions().len(), 2);
+
+    client.unblock_jurisdiction(&admin, &ir);
+    let after_unblock = client.get_blocked_jurisdictions();
+    assert_eq!(after_unblock.len(), 1);
+    assert_eq!(after_unblock.get(0).unwrap(), kp);
+    assert!(!client.is_jurisdiction_blocked(&ir));
+    assert!(client.is_jurisdiction_blocked(&kp));
+}

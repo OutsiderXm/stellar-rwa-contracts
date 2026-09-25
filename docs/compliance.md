@@ -86,6 +86,14 @@ jurisdiction fail `is_allowed`. Admin only.
 ### `is_jurisdiction_blocked(jurisdiction) -> bool`
 Whether a jurisdiction is currently blocked.
 
+### `get_blocked_jurisdictions() -> Vec<String>`
+Every jurisdiction currently blocked, in the order it was first blocked.
+Previously the web app had to *infer* the blocked set from which
+jurisdictions had no approved KYC records — a jurisdiction blocked before it
+ever had an approved address was invisible that way. This reads the
+contract's authoritative blocked set directly, so that inference workaround
+is no longer needed.
+
 ### `get_admin() -> Address`
 The configured admin. Errors: `NotInitialized (#2)`.
 
@@ -120,7 +128,8 @@ Listing of the contract `DataKey` variants and their storage behaviour.
 | `Admin` | - | instance | - |
 | `Allowlist` | - | instance | - |
 | `Record` | Address | persistent | per-key TTL |
-| `Blocked` | String | unknown | - |
+| `Blocked` | String | persistent | existence flag per jurisdiction |
+| `BlockedList` | - | instance | ordered `Vec<String>` backing `get_blocked_jurisdictions` |
 
 ## Security considerations
 
