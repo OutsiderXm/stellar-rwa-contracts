@@ -410,6 +410,56 @@ fn test_deactivate_already_inactive_asset_is_noop() {
 }
 
 #[test]
+fn test_reactivate_asset_restores_tvl_and_active_count() {
+    // Deactivation must not be permanent — reactivation restores TVL and
+    // active_count for the same asset id.
+    let (env, client, admin) = setup();
+    let issuer = Address::generate(&env);
+    let id = register(&env, &client, &issuer, "bond", 100);
+
+    client.deactivate_asset(&admin, &id);
+    assert_eq!(client.total_value_locked(), 0);
+    assert_eq!(client.active_count(), 0);
+    assert!(!client.get_asset(&id).active);
+
+    client.reactivate_asset(&admin, &id);
+    assert_eq!(client.total_value_locked(), 100);
+    assert_eq!(client.active_count(), 1);
+    assert!(client.get_asset(&id).active);
+}
+
+#[test]
+fn test_reactivate_already_active_asset_is_noop() {
+    let (env, client, admin) = setup();
+    let issuer = Address::generate(&env);
+    let id = register(&env, &client, &issuer, "bond", 100);
+
+    client.reactivate_asset(&admin, &id);
+    assert_eq!(client.total_value_locked(), 100);
+    assert_eq!(client.active_count(), 1);
+    assert!(client.get_asset(&id).active);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #3)")]
+fn test_reactivate_requires_admin() {
+    let (env, client, admin) = setup();
+    let issuer = Address::generate(&env);
+    let id = register(&env, &client, &issuer, "bond", 100);
+    client.deactivate_asset(&admin, &id);
+    client.reactivate_asset(&issuer, &id);
+}
+
+#[test]
+fn test_reactivate_unknown_id_fails() {
+    let (_env, client, admin) = setup();
+    assert_eq!(
+        client.try_reactivate_asset(&admin, &999u64),
+        Err(Ok(Error::AssetNotFound.into()))
+    );
+}
+
+#[test]
 #[should_panic(expected = "Error(Contract, #7)")]
 fn test_register_rejects_asset_type_with_whitespace() {
     // A padded variant of a valid type must still be rejected at
