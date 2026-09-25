@@ -3,7 +3,7 @@ use super::*;
 use compliance::{ComplianceContract, ComplianceContractClient};
 use proptest::prelude::*;
 use soroban_sdk::{
-    testutils::{Address as _, AuthorizedFunction, Events},
+    testutils::{Address as _, AuthorizedFunction, Events, Ledger},
     Address, Env, String, Symbol, Vec,
 };
 
@@ -436,6 +436,23 @@ fn test_update_valuation_negative_rejected() {
 }
 
 #[test]
+#[should_panic(expected = "Error(Contract, #13)")]
+fn test_update_valuation_oversized_change_rejected() {
+    let s = setup(1_000);
+    // Initial valuation is 50_000_000; more than a 50% jump must be rejected.
+    s.token.update_valuation(&s.admin, &200_000_000);
+}
+
+#[test]
+fn test_update_valuation_emits_event() {
+    let s = setup(1_000);
+    let count_before = s.env.events().all().events().len();
+    s.token.update_valuation(&s.admin, &60_000_000);
+    assert_eq!(s.env.events().all().events().len(), count_before + 1);
+    assert_eq!(s.token.get_metadata().valuation, 60_000_000);
+}
+
+#[test]
 fn test_set_compliance_switches_gate() {
     let s = setup(1_000);
     // A fresh compliance contract where the admin is approved.
@@ -751,8 +768,8 @@ fn test_mint_batch_credits_repeated_recipient_cumulatively() {
 fn test_get_metadata_reflects_all_mutations() {
     let s = setup(1_000);
 
-    // ── Step 1: update_valuation ─────────────────────────────────────────────
-    s.token.update_valuation(&s.admin, &99_000_000);
+    // ── Step 1: update_valuation (within the 50% per-update guard) ───────────
+    s.token.update_valuation(&s.admin, &70_000_000);
 
     // ── Step 2: pause then unpause (paused must end up false) ────────────────
     s.token.pause(&s.admin);
@@ -775,7 +792,7 @@ fn test_get_metadata_reflects_all_mutations() {
     let meta = s.token.get_metadata();
 
     // Fields touched by the setters above.
-    assert_eq!(meta.valuation, 99_000_000, "valuation not updated");
+    assert_eq!(meta.valuation, 70_000_000, "valuation not updated");
     assert!(!meta.paused, "paused flag should be false after unpause");
     assert_eq!(
         meta.compliance_contract, comp2_id,

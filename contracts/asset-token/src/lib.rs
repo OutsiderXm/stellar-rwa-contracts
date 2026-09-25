@@ -88,6 +88,17 @@ const DAY_IN_LEDGERS: u32 = 17_280;
 const INSTANCE_BUMP_AMOUNT: u32 = 30 * DAY_IN_LEDGERS;
 const INSTANCE_LIFETIME_THRESHOLD: u32 = INSTANCE_BUMP_AMOUNT - DAY_IN_LEDGERS;
 
+/// `update_valuation` rejects any single change larger than this fraction of
+/// the previous valuation, expressed in basis points (5_000 = 50%). This
+/// guards against a mistyped USD-cent value propagating to the registry's
+/// total value locked. Chosen as a generous-but-bounded ceiling: legitimate
+/// re-appraisals rarely move a real-world asset's value by more than half in
+/// one update, while a fat-fingered extra digit (a 10x+ change) is reliably
+/// caught. A valuation of `0` is exempt since there is no prior magnitude to
+/// compare against.
+const MAX_VALUATION_CHANGE_BPS: i128 = 5_000;
+const BPS_DENOMINATOR: i128 = 10_000;
+
 /// Contract ABI/behavior version. Bump on any change to storage layout or
 /// externally observable behavior so clients and the indexer can detect it.
 pub const VERSION: u32 = 1;
@@ -423,16 +434,34 @@ impl AssetTokenContract {
     }
 
     /// Update the recorded USD-cents valuation. Admin only.
+    ///
+    /// A single update may not move the valuation by more than
+    /// `MAX_VALUATION_CHANGE_BPS` of its previous value (see the constant's
+    /// doc comment for the reasoning). Larger re-appraisals must be phased
+    /// in across multiple `update_valuation` calls.
     pub fn update_valuation(env: Env, admin: Address, new_valuation: i128) {
         let mut meta = Self::require_admin(&env, &admin);
         if new_valuation < 0 {
             panic_err(&env, Error::InvalidAmount);
         }
+        let old_valuation = meta.valuation;
+        if old_valuation > 0 {
+            let diff = (new_valuation - old_valuation).abs();
+            let max_change = old_valuation
+                .checked_mul(MAX_VALUATION_CHANGE_BPS)
+                .and_then(|v| v.checked_div(BPS_DENOMINATOR))
+                .unwrap_or_else(|| panic_err(&env, Error::Overflow));
+            if diff > max_change {
+                panic_err(&env, Error::ValuationChangeTooLarge);
+            }
+        }
         meta.valuation = new_valuation;
         env.storage().instance().set(&DataKey::Metadata, &meta);
         Self::bump(&env);
-        env.events()
-            .publish((symbol_short!("valuation"),), new_valuation);
+        env.events().publish(
+            (symbol_short!("valuation"),),
+            (old_valuation, new_valuation),
+        );
     }
 
     /// Point the token at a different compliance contract. Admin only.
