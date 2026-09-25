@@ -10,6 +10,30 @@
 //! entitlement is sized against this snapshot rather than live balances, preventing
 //! post-creation transfers from inflating or diluting any holder's claim.
 //! `created_at` records the ledger at which the distribution was created for reference.
+//!
+//! # Claim deadline & reclaim policy (issue #2)
+//!
+//! A distribution may optionally carry a `deadline` (a ledger sequence number).
+//! This is a **policy decision**, documented here before the implementation
+//! below:
+//!
+//! 1. `deadline == 0` means "no deadline" — the distribution behaves exactly
+//!    as before and can be claimed at any time; funds are never reclaimable.
+//! 2. When `deadline != 0`, holders may claim normally up to and including
+//!    ledger `deadline`. Once `env.ledger().sequence() > deadline`, `claim`
+//!    is rejected with `DeadlinePassed` — holders permanently lose the
+//!    ability to claim after the deadline.
+//! 3. Once the deadline has passed, the contract **admin** — and only the
+//!    admin, not the original issuer or any other role — may call
+//!    `reclaim_unclaimed` to sweep whatever remains unclaimed
+//!    (`total_amount - distributed`) out of escrow to themselves. This
+//!    exists so an issuer-controlled admin can recover dust/unclaimed funds
+//!    rather than have them locked in the contract forever; it is
+//!    intentionally restricted to admin because the admin is the only party
+//!    that funded the escrow in the first place.
+//! 4. Reclaiming marks the distribution `completed` and clears its snapshot,
+//!    exactly like a distribution that was fully claimed. Reclaim before the
+//!    deadline, or by a non-admin, is rejected.
 
 #[cfg(test)]
 extern crate std;
@@ -42,6 +66,9 @@ pub struct Distribution {
     pub distributed: i128,
     pub created_at: u32,
     pub completed: bool,
+    /// Ledger sequence after which claims are rejected and the admin may
+    /// reclaim unclaimed funds (issue #2). `0` means no deadline.
+    pub deadline: u32,
 }
 
 #[contracttype]
@@ -87,6 +114,13 @@ pub enum Error {
     /// duplicate would inflate the denominator while its amount stays
     /// unclaimable — permanently stranding that slice of the escrow.
     DuplicateHolder = 11,
+    /// A claim was attempted after the distribution's `deadline` (issue #2).
+    DeadlinePassed = 12,
+    /// `reclaim_unclaimed` was called before the deadline (issue #2).
+    DeadlineNotReached = 13,
+    /// `reclaim_unclaimed` was called on a distribution with no deadline set
+    /// (`deadline == 0`), i.e. one whose policy never permits reclaiming.
+    NoDeadline = 14,
 }
 
 const DAY_IN_LEDGERS: u32 = 17_280;
@@ -146,6 +180,30 @@ impl DividendContract {
         payment_token: Address,
         total_amount: i128,
         eligible: Vec<(Address, i128)>,
+    ) -> u64 {
+        Self::create_distribution_deadline(
+            env,
+            admin,
+            asset_token,
+            payment_token,
+            total_amount,
+            eligible,
+            0,
+        )
+    }
+
+    /// Same as `create_distribution`, but sets a claim `deadline` (a ledger
+    /// sequence number). See the module-level "Claim deadline & reclaim
+    /// policy" doc for the rules a non-zero deadline enables (issue #2).
+    /// `deadline == 0` is equivalent to `create_distribution` (no deadline).
+    pub fn create_distribution_deadline(
+        env: Env,
+        admin: Address,
+        asset_token: Address,
+        payment_token: Address,
+        total_amount: i128,
+        eligible: Vec<(Address, i128)>,
+        deadline: u32,
     ) -> u64 {
         Self::require_admin(&env, &admin);
         if total_amount <= 0 {
@@ -213,6 +271,7 @@ impl DividendContract {
             distributed: 0,
             created_at: env.ledger().sequence(),
             completed: false,
+            deadline,
         };
         env.storage().persistent().set(&DataKey::Dist(id), &dist);
         env.storage().persistent().extend_ttl(
@@ -290,6 +349,12 @@ impl DividendContract {
     pub fn claim(env: Env, distribution_id: u64, holder: Address) {
         holder.require_auth();
         let mut dist = Self::load(&env, distribution_id);
+        // Policy (issue #2): once past the deadline, claims are rejected —
+        // only `reclaim_unclaimed` (admin-only) may move funds after this
+        // point.
+        if dist.deadline != 0 && env.ledger().sequence() > dist.deadline {
+            panic_err(&env, Error::DeadlinePassed);
+        }
         if Self::has_claimed(env.clone(), distribution_id, holder.clone()) {
             panic_err(&env, Error::AlreadyClaimed);
         }
@@ -334,6 +399,53 @@ impl DividendContract {
         bump(&env);
         env.events()
             .publish((symbol_short!("claim"), holder), (distribution_id, amount));
+    }
+
+    /// Sweep whatever remains unclaimed (`total_amount - distributed`) out of
+    /// escrow to the admin, once a distribution's deadline has passed.
+    /// Admin-authorized only (issue #2 policy). Errors:
+    /// `NoDeadline (#14)` if the distribution has no deadline set;
+    /// `DeadlineNotReached (#13)` if called before the deadline;
+    /// `NothingToClaim (#6)` if everything was already claimed or reclaimed.
+    pub fn reclaim_unclaimed(env: Env, admin: Address, distribution_id: u64) -> i128 {
+        Self::require_admin(&env, &admin);
+        let mut dist = Self::load(&env, distribution_id);
+        if dist.deadline == 0 {
+            panic_err(&env, Error::NoDeadline);
+        }
+        if env.ledger().sequence() <= dist.deadline {
+            panic_err(&env, Error::DeadlineNotReached);
+        }
+        let remaining = dist.total_amount - dist.distributed;
+        if remaining <= 0 {
+            panic_err(&env, Error::NothingToClaim);
+        }
+
+        let this = env.current_contract_address();
+        TokenClient::new(&env, &dist.payment_token).transfer(&this, &admin, &remaining);
+
+        dist.distributed = dist.total_amount;
+        dist.completed = true;
+        env.storage()
+            .persistent()
+            .remove(&DataKey::Snapshot(distribution_id));
+        env.storage()
+            .persistent()
+            .remove(&DataKey::Supply(distribution_id));
+        env.storage()
+            .persistent()
+            .set(&DataKey::Dist(distribution_id), &dist);
+        env.storage().persistent().extend_ttl(
+            &DataKey::Dist(distribution_id),
+            INSTANCE_LIFETIME_THRESHOLD,
+            INSTANCE_BUMP_AMOUNT,
+        );
+        bump(&env);
+        env.events().publish(
+            (symbol_short!("reclaim"), admin),
+            (distribution_id, remaining),
+        );
+        remaining
     }
 
     /// Fetch a distribution by id.

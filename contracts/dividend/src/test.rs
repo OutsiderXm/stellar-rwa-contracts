@@ -4,7 +4,7 @@ use asset_token::{AssetTokenContract, AssetTokenContractClient};
 use compliance::{ComplianceContract, ComplianceContractClient};
 use proptest::prelude::*;
 use soroban_sdk::{
-    testutils::{Address as _, AuthorizedFunction},
+    testutils::{Address as _, AuthorizedFunction, Ledger},
     token, Address, Env, String, Symbol, Vec,
 };
 
@@ -833,4 +833,107 @@ fn test_interleaved_claims_by_different_holders_all_succeed() {
     assert!(ctx.dividend.has_claimed(&id, &ctx.h1));
     assert!(ctx.dividend.has_claimed(&id, &ctx.h2));
     assert!(ctx.dividend.has_claimed(&id, &ctx.admin));
+}
+
+// ---- issue #2: claim deadline & reclaim policy ----
+
+fn set_ledger_sequence(env: &Env, seq: u32) {
+    env.ledger().with_mut(|li| li.sequence_number = seq);
+}
+
+// Claiming before the deadline succeeds normally.
+#[test]
+fn test_claim_before_deadline_succeeds() {
+    let ctx = setup();
+    let deadline = ctx.env.ledger().sequence() + 100;
+    let id = ctx.dividend.create_distribution_deadline(
+        &ctx.admin,
+        &ctx.asset_id,
+        &ctx.pay_id,
+        &1000,
+        &eligible(&ctx),
+        &deadline,
+    );
+    ctx.dividend.claim(&id, &ctx.h1);
+    assert_eq!(pay_balance(&ctx, &ctx.h1), 300);
+}
+
+// Claiming after the deadline is rejected, even for a holder who never
+// claimed before.
+#[test]
+#[should_panic(expected = "Error(Contract, #12)")]
+fn test_claim_after_deadline_fails() {
+    let ctx = setup();
+    let deadline = ctx.env.ledger().sequence() + 100;
+    let id = ctx.dividend.create_distribution_deadline(
+        &ctx.admin,
+        &ctx.asset_id,
+        &ctx.pay_id,
+        &1000,
+        &eligible(&ctx),
+        &deadline,
+    );
+    set_ledger_sequence(&ctx.env, deadline + 1);
+    ctx.dividend.claim(&id, &ctx.h1);
+}
+
+// Once the deadline has passed, the admin can reclaim whatever was never
+// claimed, and the distribution is marked completed.
+#[test]
+fn test_reclaim_unclaimed_after_deadline() {
+    let ctx = setup();
+    let deadline = ctx.env.ledger().sequence() + 100;
+    let id = ctx.dividend.create_distribution_deadline(
+        &ctx.admin,
+        &ctx.asset_id,
+        &ctx.pay_id,
+        &1000,
+        &eligible(&ctx),
+        &deadline,
+    );
+    // h1 claims their share before the deadline; h2 and admin never claim.
+    ctx.dividend.claim(&id, &ctx.h1);
+
+    set_ledger_sequence(&ctx.env, deadline + 1);
+    let admin_before = pay_balance(&ctx, &ctx.admin);
+    let reclaimed = ctx.dividend.reclaim_unclaimed(&ctx.admin, &id);
+    assert_eq!(reclaimed, 700); // 1000 - 300 claimed by h1
+    assert_eq!(pay_balance(&ctx, &ctx.admin), admin_before + 700);
+
+    let d = ctx.dividend.get_distribution(&id);
+    assert!(d.completed);
+    assert_eq!(d.distributed, d.total_amount);
+}
+
+// Reclaiming before the deadline must fail.
+#[test]
+#[should_panic(expected = "Error(Contract, #13)")]
+fn test_reclaim_before_deadline_fails() {
+    let ctx = setup();
+    let deadline = ctx.env.ledger().sequence() + 100;
+    let id = ctx.dividend.create_distribution_deadline(
+        &ctx.admin,
+        &ctx.asset_id,
+        &ctx.pay_id,
+        &1000,
+        &eligible(&ctx),
+        &deadline,
+    );
+    ctx.dividend.reclaim_unclaimed(&ctx.admin, &id);
+}
+
+// A distribution with no deadline (the default) can never be reclaimed.
+#[test]
+#[should_panic(expected = "Error(Contract, #14)")]
+fn test_reclaim_without_deadline_fails() {
+    let ctx = setup();
+    let id = ctx.dividend.create_distribution(
+        &ctx.admin,
+        &ctx.asset_id,
+        &ctx.pay_id,
+        &1000,
+        &eligible(&ctx),
+    );
+    set_ledger_sequence(&ctx.env, ctx.env.ledger().sequence() + 1_000_000);
+    ctx.dividend.reclaim_unclaimed(&ctx.admin, &id);
 }
