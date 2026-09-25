@@ -41,6 +41,10 @@ enum DataKey {
     IssuerIndex(Address),
     TypeIndex(String),
     TotalValuation,
+    /// Reverse index from token contract address to its registered asset id,
+    /// used to reject double-registration of the same token contract
+    /// (issue #308: duplicate registration would double-count in TVL).
+    TokenContractIndex(Address),
 }
 
 #[contracterror]
@@ -54,6 +58,8 @@ pub enum Error {
     InvalidValuation = 5,
     Overflow = 6,
     InvalidInput = 7,
+    /// A token contract is already registered under a different asset id.
+    DuplicateAsset = 8,
 }
 
 const DAY_IN_LEDGERS: u32 = 17_280;
@@ -110,6 +116,13 @@ impl RegistryContract {
             panic_err(&env, Error::InvalidInput);
         }
         validate_asset_type(&env, &asset_type);
+        // Reject re-registering the same token contract under a new id
+        // (issue #308): otherwise TVL and the explore page would double-count
+        // the same underlying asset.
+        let token_index_key = DataKey::TokenContractIndex(token_contract.clone());
+        if env.storage().persistent().has(&token_index_key) {
+            panic_err(&env, Error::DuplicateAsset);
+        }
         let id: u64 = env.storage().instance().get(&DataKey::Counter).unwrap_or(0) + 1;
         let entry = AssetEntry {
             id,
@@ -124,6 +137,12 @@ impl RegistryContract {
         env.storage().persistent().set(&DataKey::Asset(id), &entry);
         env.storage().persistent().extend_ttl(
             &DataKey::Asset(id),
+            INSTANCE_LIFETIME_THRESHOLD,
+            INSTANCE_BUMP_AMOUNT,
+        );
+        env.storage().persistent().set(&token_index_key, &id);
+        env.storage().persistent().extend_ttl(
+            &token_index_key,
             INSTANCE_LIFETIME_THRESHOLD,
             INSTANCE_BUMP_AMOUNT,
         );

@@ -24,6 +24,8 @@ and reports total value locked (TVL).
 - `initialize(admin)` — sets admin. Once only. `AlreadyInitialized (#1)`.
 - `register_asset(issuer, token_contract, name, asset_type, valuation) -> u64` —
   issuer auth; assigns and returns the id. `InvalidValuation (#5)` if negative.
+  Rejects `token_contract` values already registered under another id with
+  `DuplicateAsset (#8)` — see "Duplicate registration" below.
 - `get_asset(asset_id) -> AssetEntry` — `AssetNotFound (#4)`.
 - `get_assets_by_issuer(issuer) -> Vec<AssetEntry>`
 - `get_assets_by_type(asset_type) -> Vec<AssetEntry>`
@@ -32,6 +34,19 @@ and reports total value locked (TVL).
 - `total_value_locked() -> i128` — sum of `valuation` over active assets.
 - `asset_count() -> u64`
 - `get_admin() -> Address`
+
+### Duplicate registration (issue #308)
+
+`register_asset` maintains a reverse index from `token_contract` to its
+assigned asset id. If the same token contract address is registered a second
+time — under any issuer, name, or asset type — the call reverts with
+`DuplicateAsset (#8)` before any state changes. This is intentional: allowing
+the same token contract under two registry ids would let `total_value_locked`
+and `get_all_assets` double-count it, inflating the TVL figure shown on the
+landing page and producing duplicate entries on the explore page. Covered by
+`test_duplicate_token_contract_registration_rejected` in
+`contracts/registry/src/test.rs`.
+
 
 ## Errors
 
@@ -42,6 +57,7 @@ and reports total value locked (TVL).
 | 3    | Unauthorized       | non-admin deactivation         |
 | 4    | AssetNotFound      | unknown id                     |
 | 5    | InvalidValuation   | negative valuation             |
+| 8    | DuplicateAsset     | token_contract already registered |
 
 ## Events
 

@@ -408,3 +408,41 @@ fn test_deactivate_already_inactive_asset_is_noop() {
     assert_eq!(client.total_value_locked(), 0);
     assert!(!client.get_asset(&id).active);
 }
+
+// ---- issue #308: duplicate token_contract registration ----
+
+/// Registering the same token contract twice must be rejected, otherwise TVL
+/// and any client reading `get_all_assets` would double-count the same
+/// underlying asset under two distinct registry ids.
+#[test]
+#[should_panic(expected = "Error(Contract, #8)")]
+fn test_duplicate_token_contract_registration_rejected() {
+    let (env, client, _admin) = setup();
+    let issuer = Address::generate(&env);
+    let token = Address::generate(&env);
+    client.register_asset(
+        &issuer,
+        &token,
+        &String::from_str(&env, "Asset One"),
+        &String::from_str(&env, "real_estate"),
+        &100,
+    );
+    // Same token_contract, even under a different issuer/name, must be rejected.
+    let other_issuer = Address::generate(&env);
+    client.register_asset(
+        &other_issuer,
+        &token,
+        &String::from_str(&env, "Asset One Again"),
+        &String::from_str(&env, "invoice"),
+        &200,
+    );
+}
+
+#[test]
+fn test_duplicate_registration_does_not_double_count_tvl() {
+    let (env, client, _admin) = setup();
+    let issuer = Address::generate(&env);
+    register(&env, &client, &issuer, "real_estate", 100);
+    assert_eq!(client.total_value_locked(), 100);
+    assert_eq!(client.asset_count(), 1);
+}
