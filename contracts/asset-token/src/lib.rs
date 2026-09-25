@@ -150,6 +150,27 @@ impl AssetTokenContract {
 
     /// Transfer `amount` from `from` to `to`. Both parties must be
     /// compliance-approved and the token must not be paused.
+    ///
+    /// ## Deliberate policy: zero-amount transfers
+    /// A `transfer` of `0` is rejected with [`Error::InvalidAmount`] via
+    /// [`Self::check_amount`], rather than silently succeeding as a no-op.
+    /// A zero-amount call that emits a `transfer` event with no balance
+    /// change is misleading to indexers/observers and still costs the
+    /// caller fees for nothing; requiring a strictly positive amount makes
+    /// that intent explicit and forces callers to skip the call entirely
+    /// instead of relying on the contract to swallow it.
+    ///
+    /// ## Deliberate policy: self-transfers (`from == to`)
+    /// A transfer where `from == to` is **allowed** (it is not rejected)
+    /// but is short-circuited into a pure no-op: balances are not touched,
+    /// but a `transfer` event is still emitted with `new_from_bal ==
+    /// new_to_bal == from_bal` so downstream indexers see a consistent
+    /// event shape. Rejecting self-transfers outright would be an
+    /// additional special case for callers (e.g. a UI that lets a user
+    /// pick any two addresses) to defend against; treating it as an
+    /// explicit no-op is simpler and cannot corrupt balances, since the
+    /// naive "debit then credit" sequence for `from == to` would otherwise
+    /// double-apply the write and inflate the balance.
     pub fn transfer(env: Env, from: Address, to: Address, amount: i128) {
         from.require_auth();
         Self::check_amount(&env, amount);
@@ -198,6 +219,19 @@ impl AssetTokenContract {
     }
 
     /// Mint new tokens to a compliance-approved recipient. Admin only.
+    ///
+    /// ## Deliberate policy: mint gates the recipient
+    /// Unlike `transfer`, `mint` has no "sender" to gate — but the
+    /// recipient (`to`) is checked against the compliance contract exactly
+    /// like the `to` side of a `transfer`, via
+    /// `Self::compliant(&env, &meta.compliance_contract, &to)`, and reverts
+    /// with [`Error::RecipientNotCompliant`] if it fails. This is
+    /// deliberate: minting is the only way new supply enters circulation,
+    /// so if it were not gated an admin (or automation acting on the
+    /// admin's behalf) could hand tokens to an unverified address that no
+    /// `transfer` could ever have reached. `mint_batch` applies the same
+    /// per-recipient check to every entry in the batch. See
+    /// `docs/asset-token.md` for the documented decision.
     pub fn mint(env: Env, admin: Address, to: Address, amount: i128) {
         let mut meta = Self::require_admin(&env, &admin);
         Self::check_amount(&env, amount);
@@ -252,6 +286,20 @@ impl AssetTokenContract {
     }
 
     /// Burn `amount` of the caller's own tokens.
+    ///
+    /// ## Deliberate policy: a suspended holder may not burn
+    /// `burn` checks the caller against the compliance contract
+    /// (`Self::compliant(&env, &meta.compliance_contract, &from)`) exactly
+    /// like the `from` side of a `transfer`, and reverts with
+    /// [`Error::SenderNotCompliant`] if the caller is not currently
+    /// approved (whether suspended or removed outright). Burning still
+    /// moves balance and total-supply state, so it is treated as a
+    /// balance-changing operation subject to the same compliance gate as
+    /// every other one, rather than as an exception a suspended holder
+    /// could use to self-service an exit. A holder who needs to redeem or
+    /// exit while suspended must first be reinstated (or have the admin
+    /// act on their behalf via a separate, explicit path) — burn itself
+    /// does not special-case suspension.
     pub fn burn(env: Env, from: Address, amount: i128) {
         from.require_auth();
         Self::check_amount(&env, amount);
