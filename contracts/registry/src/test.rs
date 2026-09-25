@@ -496,6 +496,59 @@ fn test_tvl_running_total_matches_full_recomputation() {
 }
 
 #[test]
+fn test_get_assets_by_type_is_case_sensitive() {
+    // Matching rule for get_assets_by_type: byte-exact, so case must matter.
+    let (env, client, _admin) = setup();
+    let issuer = Address::generate(&env);
+    register(&env, &client, &issuer, "real_estate", 5);
+
+    assert_eq!(
+        client
+            .get_assets_by_type(&String::from_str(&env, "real_estate"))
+            .len(),
+        1
+    );
+    assert_eq!(
+        client
+            .get_assets_by_type(&String::from_str(&env, "Real_Estate"))
+            .len(),
+        0
+    );
+    assert_eq!(
+        client
+            .get_assets_by_type(&String::from_str(&env, "REAL_ESTATE"))
+            .len(),
+        0
+    );
+}
+
+#[test]
+fn test_get_assets_by_type_is_whitespace_sensitive() {
+    let (env, client, _admin) = setup();
+    let issuer = Address::generate(&env);
+    register(&env, &client, &issuer, "invoice", 5);
+
+    assert_eq!(
+        client
+            .get_assets_by_type(&String::from_str(&env, "invoice"))
+            .len(),
+        1
+    );
+    assert_eq!(
+        client
+            .get_assets_by_type(&String::from_str(&env, " invoice"))
+            .len(),
+        0
+    );
+    assert_eq!(
+        client
+            .get_assets_by_type(&String::from_str(&env, "invoice "))
+            .len(),
+        0
+    );
+}
+
+#[test]
 #[should_panic(expected = "Error(Contract, #7)")]
 fn test_register_rejects_asset_type_with_whitespace() {
     // A padded variant of a valid type must still be rejected at

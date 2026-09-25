@@ -213,6 +213,14 @@ impl RegistryContract {
     /// whole registry.
     /// Note: This includes both active and deactivated assets. Deactivated assets
     /// are never removed from the index; use the `active` field to filter if needed.
+    ///
+    /// Matching is **byte-exact**: the index key is the `asset_type` string as
+    /// stored on the entry at registration time, so lookups are case-sensitive
+    /// and whitespace-sensitive. `"real_estate"`, `"Real_Estate"` and
+    /// `"real_estate "` are three distinct index keys; since only the values
+    /// in `VALID_ASSET_TYPES` can ever be registered (see
+    /// `validate_asset_type`), a query must match one of those canonical
+    /// strings exactly to return any results.
     pub fn get_assets_by_type(env: Env, asset_type: String) -> Vec<AssetEntry> {
         let ids = Self::index_ids(&env, &DataKey::TypeIndex(asset_type));
         Self::fetch_assets(&env, &ids)
