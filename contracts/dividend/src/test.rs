@@ -772,3 +772,65 @@ fn test_create_distribution_allows_zero_balance_entry() {
     assert_eq!(ctx.dividend.claimable(&id, &ctx.h2), 0);
     assert_eq!(ctx.dividend.claimable(&id, &ctx.admin), 500);
 }
+
+// ---- issue #1: has_claimed double-claim guard ----
+
+// A second claim by the same holder must fail with AlreadyClaimed (#7), and
+// must not move any additional funds or mutate `distributed` a second time.
+#[test]
+#[should_panic(expected = "Error(Contract, #7)")]
+fn test_claim_twice_by_same_holder_fails() {
+    let ctx = setup();
+    let id = ctx.dividend.create_distribution(
+        &ctx.admin,
+        &ctx.asset_id,
+        &ctx.pay_id,
+        &1000,
+        &eligible(&ctx),
+    );
+    ctx.dividend.claim(&id, &ctx.h1);
+    assert!(ctx.dividend.has_claimed(&id, &ctx.h1));
+    // Second claim by the same holder must be rejected by the guard.
+    ctx.dividend.claim(&id, &ctx.h1);
+}
+
+// The guard is scoped per (distribution, holder): a holder claiming should
+// never block or consume another holder's entitlement, whether claims happen
+// interleaved (h1, h2, h1-again-fails, admin) or in any other order.
+#[test]
+fn test_interleaved_claims_by_different_holders_all_succeed() {
+    let ctx = setup();
+    let id = ctx.dividend.create_distribution(
+        &ctx.admin,
+        &ctx.asset_id,
+        &ctx.pay_id,
+        &1000,
+        &eligible(&ctx),
+    );
+
+    // h1 claims first.
+    ctx.dividend.claim(&id, &ctx.h1);
+    assert_eq!(pay_balance(&ctx, &ctx.h1), 300);
+    assert!(ctx.dividend.has_claimed(&id, &ctx.h1));
+    assert!(!ctx.dividend.has_claimed(&id, &ctx.h2));
+
+    // h2 claims next, interleaved with h1 already having claimed. h1's flag
+    // and payout must be unaffected.
+    ctx.dividend.claim(&id, &ctx.h2);
+    assert_eq!(pay_balance(&ctx, &ctx.h2), 200);
+    assert!(ctx.dividend.has_claimed(&id, &ctx.h2));
+
+    // admin claims last; all three succeed independently and the running
+    // `distributed` total reflects exactly the sum of the three payouts.
+    ctx.dividend.claim(&id, &ctx.admin);
+    assert_eq!(pay_balance(&ctx, &ctx.admin), 500);
+
+    let d = ctx.dividend.get_distribution(&id);
+    assert_eq!(d.distributed, 1000);
+    assert!(d.completed);
+
+    // Every holder is now flagged claimed, and none can claim again.
+    assert!(ctx.dividend.has_claimed(&id, &ctx.h1));
+    assert!(ctx.dividend.has_claimed(&id, &ctx.h2));
+    assert!(ctx.dividend.has_claimed(&id, &ctx.admin));
+}

@@ -267,6 +267,26 @@ impl DividendContract {
     }
 
     /// Claim a holder's proportional share, paid from escrow. Holder-authorized.
+    ///
+    /// # Double-claim guard (issue #1)
+    ///
+    /// Each `(distribution_id, holder)` pair may be claimed at most once. This
+    /// is enforced by the `DataKey::Claimed(distribution_id, holder)` flag:
+    /// `claim` checks the flag first and panics with `AlreadyClaimed (#7)` if
+    /// it is already set, then sets it to `true` **before** the outbound
+    /// token transfer. Setting the flag before the transfer (rather than
+    /// after) matters because Soroban aborts and rolls back all storage
+    /// writes if any step in the function traps — so even if the transfer
+    /// itself were to panic, there is no window where the flag is set but the
+    /// funds were not sent, nor a window where funds could be sent twice by
+    /// re-entering before the flag is persisted. Because the flag is keyed
+    /// per-holder, claims from different holders are fully independent: they
+    /// touch disjoint storage keys and interleaving them (in any order, or
+    /// concurrently across separate transactions) can never cause one
+    /// holder's claim to block or double-pay another's. See
+    /// `test::claim_twice_by_same_holder_fails` and
+    /// `test::interleaved_claims_by_different_holders_all_succeed` in
+    /// `test.rs` for the properties this guard is expected to uphold.
     pub fn claim(env: Env, distribution_id: u64, holder: Address) {
         holder.require_auth();
         let mut dist = Self::load(&env, distribution_id);
