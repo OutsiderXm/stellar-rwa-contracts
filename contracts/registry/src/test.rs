@@ -408,3 +408,21 @@ fn test_deactivate_already_inactive_asset_is_noop() {
     assert_eq!(client.total_value_locked(), 0);
     assert!(!client.get_asset(&id).active);
 }
+
+#[test]
+#[should_panic(expected = "Error(Contract, #7)")]
+fn test_register_rejects_asset_type_with_whitespace() {
+    // A padded variant of a valid type must still be rejected at
+    // registration, not silently normalised.
+    let (env, client, _admin) = setup();
+    let issuer = Address::generate(&env);
+    register(&env, &client, &issuer, "invoice ", 100);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #7)")]
+fn test_register_rejects_asset_type_with_wrong_case() {
+    let (env, client, _admin) = setup();
+    let issuer = Address::generate(&env);
+    register(&env, &client, &issuer, "Invoice", 100);
+}
