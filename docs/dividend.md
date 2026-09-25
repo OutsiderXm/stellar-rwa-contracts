@@ -60,6 +60,9 @@ pub trait TokenInterface {
 - `claim(distribution_id, holder)` — holder auth; pays the claimable amount from
   escrow, marks claimed, updates `distributed`/`completed`. Errors:
   `AlreadyClaimed (#7)`, `NothingToClaim (#6)`.
+- `cancel_distribution(admin, distribution_id)` — admin auth; returns escrowed
+  funds to the issuer. Only works while nothing has been claimed (`distributed == 0`).
+  Errors: `InvalidAmount (#5)` if any claim has been made.
 - `get_distribution(distribution_id) -> Distribution` — `DistributionNotFound (#4)`.
 - `get_distributions_for_asset(asset_token) -> Vec<Distribution>`
 - `has_claimed(distribution_id, holder) -> bool`
@@ -88,6 +91,7 @@ pub trait TokenInterface {
 | `init`    | admin                      | initialize          |
 | `created` | (admin) → (id, total)      | distribution funded |
 | `claim`   | (holder) → (id, amount)    | holder claims       |
+| `cancel`  | (admin) → distribution_id  | distribution cancelled |
 
 ## Storage / TTL
 
