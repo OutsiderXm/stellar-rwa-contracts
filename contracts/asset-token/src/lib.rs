@@ -482,14 +482,22 @@ impl AssetTokenContract {
     /// misconfigured address before it bricks every transfer.
     pub fn set_compliance(env: Env, admin: Address, compliance: Address) {
         let mut meta = Self::require_admin(&env, &admin);
+        // Probe the target for the expected interface (`is_allowed`) before
+        // accepting the swap: calling it here, before any state changes,
+        // means an address that doesn't implement `ComplianceInterface`
+        // traps this invocation instead of silently bricking every future
+        // transfer once it's already wired in as the gate.
         if !Self::compliant(&env, &compliance, &admin) {
             panic_err(&env, Error::InvalidCompliance);
         }
+        let old_compliance = meta.compliance_contract.clone();
         meta.compliance_contract = compliance.clone();
         env.storage().instance().set(&DataKey::Metadata, &meta);
         Self::bump(&env);
-        env.events()
-            .publish((symbol_short!("setcomp"),), compliance);
+        env.events().publish(
+            (symbol_short!("setcomp"),),
+            (old_compliance, compliance),
+        );
     }
 
     // ---- internal helpers ----

@@ -498,6 +498,30 @@ fn test_set_compliance_switches_gate() {
 }
 
 #[test]
+fn test_set_compliance_emits_old_and_new_addresses() {
+    let s = setup(1_000);
+    let comp2_id = env_register_empty_compliance(&s.env, &s.admin);
+    let comp2 = ComplianceContractClient::new(&s.env, &comp2_id);
+    approve(&s.env, &comp2, &s.admin, &s.admin);
+    let old_compliance = s.token.get_metadata().compliance_contract;
+    s.token.set_compliance(&s.admin, &comp2_id);
+    assert_eq!(old_compliance, s.compliance_id);
+    assert_eq!(s.token.get_metadata().compliance_contract, comp2_id);
+    let all_events = s.env.events().all();
+    assert!(!all_events.events().is_empty());
+}
+
+#[test]
+#[should_panic]
+fn test_set_compliance_rejects_non_conforming_target() {
+    let s = setup(1_000);
+    // A plain account address does not implement `is_allowed`; probing it as
+    // a compliance target must fail rather than being silently accepted.
+    let not_a_compliance_contract = Address::generate(&s.env);
+    s.token.set_compliance(&s.admin, &not_a_compliance_contract);
+}
+
+#[test]
 #[should_panic(expected = "Error(Contract, #11)")]
 fn test_set_compliance_rejects_contract_that_blocks_admin() {
     let s = setup(1_000);
