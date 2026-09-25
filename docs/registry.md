@@ -29,7 +29,12 @@ and reports total value locked (TVL).
 - `get_asset(asset_id) -> AssetEntry` — `AssetNotFound (#4)`.
 - `get_assets_by_issuer(issuer) -> Vec<AssetEntry>`
 - `get_assets_by_type(asset_type) -> Vec<AssetEntry>`
-- `get_all_assets() -> Vec<AssetEntry>`
+- `get_all_assets(start_id, limit) -> Vec<AssetEntry>` — returns ids
+  `[start_id, start_id + limit)`, capped at the current counter and at
+  `MAX_PAGE_SIZE` (100) regardless of the requested `limit`. Page through the
+  full registry by calling again with `start_id + <count returned>`. A small
+  registry that fits in one page keeps working with a single call
+  (`start_id = 1`, a large `limit`).
 - `deactivate_asset(admin, asset_id)` — admin auth; sets `active=false`.
 - `total_value_locked() -> i128` — sum of `valuation` over active assets.
 - `asset_count() -> u64`
@@ -47,6 +52,17 @@ landing page and producing duplicate entries on the explore page. Covered by
 `test_duplicate_token_contract_registration_rejected` in
 `contracts/registry/src/test.rs`.
 
+### Pagination and max page size (issue #310)
+
+`get_all_assets` always enforces `MAX_PAGE_SIZE = 100` as an upper bound on
+the number of entries returned in one call, independent of the `limit`
+argument passed in. This keeps per-call cost bounded as the registry grows,
+while existing callers that pass a large `limit` to fetch everything in one
+shot keep working unchanged as long as the registry is smaller than the cap.
+The final page of a paginated walk is partial once fewer than `limit` assets
+remain; see `test_get_all_assets_final_partial_page` and
+`test_get_all_assets_enforces_max_page_size` in
+`contracts/registry/src/test.rs`.
 
 ## Errors
 

@@ -446,3 +446,41 @@ fn test_duplicate_registration_does_not_double_count_tvl() {
     assert_eq!(client.total_value_locked(), 100);
     assert_eq!(client.asset_count(), 1);
 }
+
+// ---- issue #310: get_all_assets max page size ----
+
+/// `limit` beyond `MAX_PAGE_SIZE` is silently clamped, bounding response size
+/// regardless of what a caller requests.
+#[test]
+fn test_get_all_assets_enforces_max_page_size() {
+    let (env, client, _admin) = setup();
+    let issuer = Address::generate(&env);
+    for i in 0..5 {
+        register(&env, &client, &issuer, "real_estate", 100 + i);
+    }
+    // Requesting far more than exist, and far more than MAX_PAGE_SIZE, still
+    // only returns what's actually registered (small-registry call keeps working).
+    let result = client.get_all_assets(&1, &(MAX_PAGE_SIZE * 10));
+    assert_eq!(result.len(), 5);
+}
+
+/// The final page of a paginated walk may be partial (fewer than `limit`
+/// items) once it reaches the end of the registry.
+#[test]
+fn test_get_all_assets_final_partial_page() {
+    let (env, client, _admin) = setup();
+    let issuer = Address::generate(&env);
+    for i in 0..7 {
+        register(&env, &client, &issuer, "real_estate", 100 + i);
+    }
+    let page_size = 3u32;
+    let first = client.get_all_assets(&1, &page_size);
+    assert_eq!(first.len(), 3);
+    let second = client.get_all_assets(&4, &page_size);
+    assert_eq!(second.len(), 3);
+    // Final page is partial: only 1 asset remains (7 total, 6 already read).
+    let third = client.get_all_assets(&7, &page_size);
+    assert_eq!(third.len(), 1);
+    let fourth = client.get_all_assets(&8, &page_size);
+    assert_eq!(fourth.len(), 0);
+}

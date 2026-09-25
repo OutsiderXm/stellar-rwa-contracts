@@ -66,6 +66,12 @@ const DAY_IN_LEDGERS: u32 = 17_280;
 const INSTANCE_BUMP_AMOUNT: u32 = 30 * DAY_IN_LEDGERS;
 const INSTANCE_LIFETIME_THRESHOLD: u32 = INSTANCE_BUMP_AMOUNT - DAY_IN_LEDGERS;
 
+/// Maximum number of assets `get_all_assets` will return in a single call,
+/// regardless of the requested `limit` (issue #310). Callers that need more
+/// must page through with successive calls using the returned count to
+/// compute the next `start_id`.
+pub const MAX_PAGE_SIZE: u32 = 100;
+
 /// Contract ABI/behavior version. Bump on any change to storage layout or
 /// externally observable behavior so clients and the indexer can detect it.
 pub const VERSION: u32 = 1;
@@ -241,11 +247,18 @@ impl RegistryContract {
     /// capped at the current counter. Page through the full set by calling
     /// again with `start_id + limit`. Bounds per-call cost regardless of how
     /// many assets have been registered.
+    ///
+    /// `limit` is silently clamped to [`MAX_PAGE_SIZE`] (issue #310) so a
+    /// misbehaving or malicious caller cannot force an unbounded response;
+    /// small registries that request the whole set in one call (e.g.
+    /// `start_id = 1, limit = u32::MAX`) keep working exactly as before as
+    /// long as they fit under the cap.
     pub fn get_all_assets(env: Env, start_id: u64, limit: u32) -> Vec<AssetEntry> {
         let counter: u64 = env.storage().instance().get(&DataKey::Counter).unwrap_or(0);
         let mut out = Vec::new(&env);
         let start = start_id.max(1);
-        let end = start.saturating_add(limit as u64).min(counter + 1);
+        let capped_limit = limit.min(MAX_PAGE_SIZE);
+        let end = start.saturating_add(capped_limit as u64).min(counter + 1);
         let mut id = start;
         while id < end {
             if let Some(entry) = env.storage().persistent().get(&DataKey::Asset(id)) {
