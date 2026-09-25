@@ -402,6 +402,37 @@ fn test_mint_blocked_when_paused() {
 }
 
 #[test]
+#[should_panic(expected = "Error(Contract, #6)")]
+fn test_burn_blocked_when_paused() {
+    let s = setup(1_000);
+    s.token.pause(&s.admin);
+    s.token.burn(&s.admin, &100);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #6)")]
+fn test_approve_blocked_when_paused() {
+    let s = setup(1_000);
+    let bob = Address::generate(&s.env);
+    s.token.pause(&s.admin);
+    s.token.approve(&s.admin, &bob, &100, &(s.env.ledger().sequence() + 100));
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #6)")]
+fn test_transfer_from_blocked_when_paused() {
+    let s = setup(1_000);
+    let bob = Address::generate(&s.env);
+    let carol = Address::generate(&s.env);
+    approve(&s.env, &s.compliance, &s.admin, &bob);
+    approve(&s.env, &s.compliance, &s.admin, &carol);
+    let expiration = s.env.ledger().sequence() + 100;
+    s.token.approve(&s.admin, &bob, &100, &expiration);
+    s.token.pause(&s.admin);
+    s.token.transfer_from(&bob, &s.admin, &carol, &50);
+}
+
+#[test]
 fn test_mint_succeeds_after_unpause() {
     let s = setup(1_000);
     let bob = Address::generate(&s.env);

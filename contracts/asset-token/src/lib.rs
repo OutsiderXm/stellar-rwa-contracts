@@ -410,7 +410,16 @@ impl AssetTokenContract {
         Self::metadata(&env).total_supply
     }
 
-    /// Pause all transfers and mints. Admin only.
+    /// Pause every balance-changing operation. Admin only.
+    ///
+    /// Policy: while paused, `transfer`, `transfer_from`, `mint`,
+    /// `mint_batch` and `burn` all revert with `Error::Paused`. `approve` is
+    /// also rejected (see docs/asset-token.md) so no allowance can be queued
+    /// up to fire the instant the token is unpaused. Read-only calls
+    /// (`balance`, `allowance`, `get_metadata`, `total_supply`) keep working.
+    /// This is intentionally total: a pause is meant to freeze token state
+    /// during an incident, not just block trading while admin actions
+    /// continue.
     pub fn pause(env: Env, admin: Address) {
         let mut meta = Self::require_admin(&env, &admin);
         meta.paused = true;
