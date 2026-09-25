@@ -64,6 +64,19 @@ remain; see `test_get_all_assets_final_partial_page` and
 `test_get_all_assets_enforces_max_page_size` in
 `contracts/registry/src/test.rs`.
 
+### Deactivation and TVL (issue #306)
+
+`deactivate_asset` is intentionally **exclusive**: as soon as an asset is
+deactivated, its `valuation` is subtracted from `TotalValuation` in the same
+call, and it is excluded from every subsequent `total_value_locked()` read.
+It is never re-added implicitly — an asset must be re-registered (as a new
+id) to count again. This is the correct behavior for a headline TVL figure:
+a deactivated asset (e.g. delisted, fraudulent, or redeemed) should not
+inflate the number shown on the landing page. The web app's TVL display
+reads `total_value_locked()` directly, so it reflects this automatically.
+Covered by `test_deactivate_excludes_from_tvl` and `test_tvl_sums_only_active`
+in `contracts/registry/src/test.rs`.
+
 ## Errors
 
 | Code | Name               | Cause                          |
