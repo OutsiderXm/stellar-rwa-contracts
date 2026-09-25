@@ -53,6 +53,54 @@ fn approve(env: &Env, compliance: &ComplianceContractClient, admin: &Address, wh
 }
 
 #[test]
+fn test_approve_then_transfer_from() {
+    let s = setup(1_000);
+    let bob = Address::generate(&s.env);
+    let carol = Address::generate(&s.env);
+    approve(&s.env, &s.compliance, &s.admin, &bob);
+    approve(&s.env, &s.compliance, &s.admin, &carol);
+
+    let expiration = s.env.ledger().sequence() + 1_000;
+    s.token.approve(&s.admin, &bob, &300, &expiration);
+    assert_eq!(s.token.allowance(&s.admin, &bob), 300);
+
+    s.token.transfer_from(&bob, &s.admin, &carol, &200);
+    assert_eq!(s.token.balance(&s.admin), 800);
+    assert_eq!(s.token.balance(&carol), 200);
+    assert_eq!(s.token.allowance(&s.admin, &bob), 100);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #12)")]
+fn test_transfer_from_over_allowance_rejected() {
+    let s = setup(1_000);
+    let bob = Address::generate(&s.env);
+    let carol = Address::generate(&s.env);
+    approve(&s.env, &s.compliance, &s.admin, &bob);
+    approve(&s.env, &s.compliance, &s.admin, &carol);
+
+    let expiration = s.env.ledger().sequence() + 1_000;
+    s.token.approve(&s.admin, &bob, &100, &expiration);
+    s.token.transfer_from(&bob, &s.admin, &carol, &200);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #12)")]
+fn test_transfer_from_after_expiry_rejected() {
+    let s = setup(1_000);
+    let bob = Address::generate(&s.env);
+    let carol = Address::generate(&s.env);
+    approve(&s.env, &s.compliance, &s.admin, &bob);
+    approve(&s.env, &s.compliance, &s.admin, &carol);
+
+    let expiration = s.env.ledger().sequence() + 5;
+    s.token.approve(&s.admin, &bob, &200, &expiration);
+    s.env.ledger().with_mut(|li| li.sequence_number = expiration + 1);
+    assert_eq!(s.token.allowance(&s.admin, &bob), 0);
+    s.token.transfer_from(&bob, &s.admin, &carol, &50);
+}
+
+#[test]
 fn test_version() {
     let s = setup(1_000);
     assert_eq!(s.token.version(), VERSION);

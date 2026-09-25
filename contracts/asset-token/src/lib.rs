@@ -48,6 +48,15 @@ pub struct AssetMetadata {
 enum DataKey {
     Metadata,
     Balance(Address),
+    Allowance(Address, Address),
+}
+
+/// SEP-41 allowance record: amount plus the ledger sequence it expires at.
+#[contracttype]
+#[derive(Clone)]
+pub struct AllowanceValue {
+    pub amount: i128,
+    pub expiration_ledger: u32,
 }
 
 #[contracterror]
@@ -65,6 +74,8 @@ pub enum Error {
     Overflow = 9,
     InvalidInput = 10,
     InvalidCompliance = 11,
+    InsufficientAllowance = 12,
+    ValuationChangeTooLarge = 13,
 }
 
 /// Maximum byte lengths for string metadata fields (issue #46).
@@ -274,6 +285,105 @@ impl AssetTokenContract {
         env.storage().instance().set(&DataKey::Metadata, &meta);
         Self::bump(&env);
         env.events().publish((symbol_short!("burn"), from), amount);
+    }
+
+    /// SEP-41: authorize `spender` to move up to `amount` of `from`'s tokens
+    /// until `expiration_ledger` (inclusive). Passing `amount == 0` clears the
+    /// allowance regardless of `expiration_ledger`. Divergence from the raw
+    /// spec: paused tokens reject `approve` the same as `transfer`, since an
+    /// approval is only meaningful if a matching `transfer_from` could later
+    /// succeed (documented in docs/asset-token.md).
+    pub fn approve(env: Env, from: Address, spender: Address, amount: i128, expiration_ledger: u32) {
+        from.require_auth();
+        if amount < 0 {
+            panic_err(&env, Error::InvalidAmount);
+        }
+        let meta = Self::metadata(&env);
+        if meta.paused {
+            panic_err(&env, Error::Paused);
+        }
+        if amount > 0 && expiration_ledger < env.ledger().sequence() {
+            panic_err(&env, Error::InvalidInput);
+        }
+        let key = DataKey::Allowance(from.clone(), spender.clone());
+        env.storage().temporary().set(
+            &key,
+            &AllowanceValue {
+                amount,
+                expiration_ledger,
+            },
+        );
+        if amount > 0 {
+            let live_for = expiration_ledger.saturating_sub(env.ledger().sequence());
+            env.storage().temporary().extend_ttl(&key, live_for, live_for);
+        }
+        env.events().publish(
+            (symbol_short!("approve"), from, spender),
+            (amount, expiration_ledger),
+        );
+    }
+
+    /// SEP-41: remaining amount `spender` may transfer from `from`. Returns 0
+    /// once `expiration_ledger` has passed, matching the spec's "expired
+    /// allowances read as zero" semantics rather than returning a stale value.
+    pub fn allowance(env: Env, from: Address, spender: Address) -> i128 {
+        let key = DataKey::Allowance(from, spender);
+        match env.storage().temporary().get::<_, AllowanceValue>(&key) {
+            Some(v) if v.expiration_ledger >= env.ledger().sequence() => v.amount,
+            _ => 0,
+        }
+    }
+
+    /// SEP-41: move `amount` from `from` to `to` using a prior `approve`.
+    /// Subject to the same pause/compliance gates as `transfer`.
+    pub fn transfer_from(env: Env, spender: Address, from: Address, to: Address, amount: i128) {
+        spender.require_auth();
+        Self::check_amount(&env, amount);
+        let meta = Self::metadata(&env);
+        if meta.paused {
+            panic_err(&env, Error::Paused);
+        }
+        if !Self::compliant(&env, &meta.compliance_contract, &from) {
+            panic_err(&env, Error::SenderNotCompliant);
+        }
+        if !Self::compliant(&env, &meta.compliance_contract, &to) {
+            panic_err(&env, Error::RecipientNotCompliant);
+        }
+        let key = DataKey::Allowance(from.clone(), spender.clone());
+        let current = env
+            .storage()
+            .temporary()
+            .get::<_, AllowanceValue>(&key)
+            .unwrap_or(AllowanceValue {
+                amount: 0,
+                expiration_ledger: 0,
+            });
+        if current.expiration_ledger < env.ledger().sequence() || current.amount < amount {
+            panic_err(&env, Error::InsufficientAllowance);
+        }
+        let from_bal = Self::balance(env.clone(), from.clone());
+        if from_bal < amount {
+            panic_err(&env, Error::InsufficientBalance);
+        }
+        let new_from_bal = from_bal - amount;
+        Self::set_balance(&env, &from, new_from_bal);
+        let to_bal = Self::balance(env.clone(), to.clone());
+        let new_to_bal = to_bal
+            .checked_add(amount)
+            .unwrap_or_else(|| panic_err(&env, Error::Overflow));
+        Self::set_balance(&env, &to, new_to_bal);
+        env.storage().temporary().set(
+            &key,
+            &AllowanceValue {
+                amount: current.amount - amount,
+                expiration_ledger: current.expiration_ledger,
+            },
+        );
+        Self::bump(&env);
+        env.events().publish(
+            (symbol_short!("transfer"), from, to),
+            (amount, new_from_bal, new_to_bal),
+        );
     }
 
     /// Current balance of `id`.

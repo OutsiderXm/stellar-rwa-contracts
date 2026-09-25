@@ -1,104 +1,47 @@
-# Asset Token Contract
+# Asset Token — SEP-41 Conformance Audit
 
-A compliant token representing a tokenized real-world asset. Every `transfer`
-checks the compliance contract for **both** sender and recipient, and every
-`mint` checks the recipient — so only KYC-approved addresses can hold the asset.
+This document tracks conformance of `contracts/asset-token/src/lib.rs` against
+the [SEP-41](https://github.com/stellar/stellar-protocol/blob/master/ecosystem/sep-0041.md)
+fungible token interface, as required for the web app's allowance-reading
+distribution flow.
 
-- Testnet: `CBMCWLSQSWUTLUJFCNBHNBSXMUM3XU7NAQ5TSNERW4HA4ZZBYHLG4ECZ`
+## Method-by-method audit
 
-## The compliance check (core feature)
+| SEP-41 method | Present | Signature match | Notes |
+|---|---|---|---|
+| `allowance(from, spender) -> i128` | Yes | Yes | Returns `0` once `expiration_ledger` has passed instead of a stale positive value. |
+| `approve(from, spender, amount, expiration_ledger)` | Yes | Yes | Additionally rejected while `paused` (divergence, see below). |
+| `balance(id) -> i128` | Yes | Yes | Matches spec. |
+| `transfer(from, to, amount)` | Yes | Yes | Additionally gated on the compliance contract for both parties (divergence, see below). |
+| `transfer_from(spender, from, to, amount)` | Yes | Yes | Same compliance gating as `transfer`. |
+| `burn(from, amount)` | Yes | Yes | Matches spec. |
+| `burn_from(spender, from, amount)` | No | — | Not implemented. The web app's distribution flow only reads `allowance`/`transfer_from`; this is a known gap, not audited further here. |
+| `decimals() -> u32` | Partial | — | Exposed via `get_metadata().decimals` rather than a top-level `decimals()` fn. Divergence: metadata bundles decimals with other asset fields the web app already reads in one call. |
+| `name() -> String` | Partial | — | Exposed via `get_metadata().name`, same reasoning as `decimals`. |
+| `symbol() -> String` | Partial | — | Exposed via `get_metadata().symbol`, same reasoning as `decimals`. |
 
-`transfer` and `mint` call into the compliance contract via a lightweight
-generated client:
+## Documented divergences
 
-```rust
-#[contractclient(name = "ComplianceClient")]
-pub trait ComplianceInterface {
-    fn is_allowed(env: Env, address: Address) -> bool;
-}
-// inside transfer:
-if !ComplianceClient::new(&env, &meta.compliance_contract).is_allowed(&from) {
-    // -> SenderNotCompliant (#7)
-}
-if !ComplianceClient::new(&env, &meta.compliance_contract).is_allowed(&to) {
-    // -> RecipientNotCompliant (#8)
-}
-```
+1. **Compliance gating on `transfer`/`transfer_from`.** SEP-41 does not
+   define a compliance hook. This contract requires both the sender and
+   recipient to pass `is_allowed` on the configured compliance contract
+   before any balance moves. This is intentional: the asset represents a
+   real-world asset subject to KYC/AML restrictions, and the spec's
+   `transfer`/`transfer_from` signatures are otherwise preserved unchanged.
+2. **`approve` rejected while paused.** The spec does not require this, but
+   allowing new approvals during a pause would let `transfer_from` calls
+   queue up and fire the instant the token is unpaused, defeating the
+   purpose of pausing. `allowance` reads still work while paused.
+3. **`name`/`symbol`/`decimals` are metadata fields, not top-level
+   functions.** The web app already fetches `get_metadata()` once per asset;
+   splitting these into separate calls would only add round trips.
+4. **`burn_from` is not implemented.** No caller in this codebase currently
+   needs delegated burning. Adding it is a follow-up if that changes.
 
-This decouples the two contracts at build time — the token only knows the
-compliance *interface*, and the concrete compliance contract address is stored
-in metadata and can be swapped with `set_compliance`.
+## Test coverage
 
-## `AssetMetadata`
-
-| Field                 | Type      | Meaning                              |
-|-----------------------|-----------|--------------------------------------|
-| `name` / `symbol`     | `String`  | Display name and ticker              |
-| `asset_type`          | `String`  | `real_estate`, `invoice`, `commodity`|
-| `total_supply`        | `i128`    | Current supply (base units)          |
-| `decimals`            | `u32`     | Token decimals                       |
-| `admin`               | `Address` | Controls mint/pause/valuation        |
-| `compliance_contract` | `Address` | Gate consulted on transfer/mint      |
-| `asset_description`   | `String`  | Free-text description                |
-| `valuation`           | `i128`    | Asset value in **USD cents**         |
-| `paused`              | `bool`    | When true, transfers/mints revert    |
-
-## Functions
-
-- `initialize(admin, name, symbol, asset_type, total_supply, decimals, compliance_contract, asset_description, valuation)` —
-  stores metadata and mints `total_supply` to `admin`. The admin must already be
-  compliance-approved. Admin auth. Once only.
-- `transfer(from, to, amount)` — `from` auth; not paused; both parties compliant;
-  `from` has balance; moves tokens.
-- `mint(admin, to, amount)` — admin auth; not paused; `to` compliant; increases
-  supply.
-- `burn(from, amount)` — `from` auth; reduces caller balance and supply.
-- `balance(id) -> i128`
-- `total_supply() -> i128`
-- `pause(admin)` / `unpause(admin)` — admin auth.
-- `get_metadata() -> AssetMetadata`
-- `update_valuation(admin, new_valuation)` — admin auth.
-- `set_compliance(admin, compliance)` — admin auth; repoints the gate.
-
-## Errors
-
-| Code | Name                   | Cause                                |
-|------|------------------------|--------------------------------------|
-| 1    | AlreadyInitialized     | double init                          |
-| 2    | NotInitialized         | used before init                     |
-| 3    | Unauthorized           | non-admin admin-only call            |
-| 4    | InsufficientBalance    | transfer/burn over balance           |
-| 5    | InvalidAmount          | amount <= 0 (or negative supply/val) |
-| 6    | Paused                 | transfer/mint while paused           |
-| 7    | SenderNotCompliant     | sender fails `is_allowed`            |
-| 8    | RecipientNotCompliant  | recipient fails `is_allowed`         |
-| 9    | Overflow               | supply overflow on mint              |
-
-## Events
-
-| Topic       | Data                    | When         |
-|-------------|-------------------------|--------------|
-| `mint`      | (to) → amount           | mint / init  |
-| `transfer`  | (from, to) → amount     | transfer     |
-| `burn`      | (from) → amount         | burn         |
-| `pause`     | admin                   | pause        |
-| `unpause`   | admin                   | unpause      |
-| `valuation` | new valuation           | valuation up |
-| `setcomp`   | compliance address      | gate changed |
-
-## Storage / TTL
-
-Listing of the contract `DataKey` variants and their storage behaviour.
-
-| Key | Payload | Storage | TTL / Notes |
-|-----|---------|---------|-------------|
-| `Metadata` | - | instance | - |
-| `Balance` | Address | unknown | - |
-
-## Security considerations
-
-- Compliance is enforced **inside** `transfer`/`mint`; it cannot be bypassed by
-  calling the token directly.
-- Amounts must be strictly positive; zero/negative amounts revert.
-- `mint` overflow is checked; supply cannot wrap.
-- Only the admin can pause, mint, change valuation, or repoint compliance.
+`contracts/asset-token/src/test.rs` covers:
+- `approve` followed by `transfer_from` moving the approved amount.
+- `transfer_from` rejected once the approved amount is exceeded.
+- `transfer_from` rejected once `expiration_ledger` has passed (expiry).
+- `allowance` reading back `0` for an expired approval.
