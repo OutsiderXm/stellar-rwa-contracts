@@ -106,3 +106,6 @@ MIT — see [LICENSE](LICENSE).
 
 <!-- handsoff-issue-390 -->
 - #390: Test concurrent claims against the same distribution
+
+<!-- handsoff-issue-400 -->
+- #400: Add an integration test exercising all four contracts together
