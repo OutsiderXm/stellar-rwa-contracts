@@ -10,6 +10,32 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  changelog:
+    # Contract source changes must come with a CHANGELOG.md entry so the
+    # changelog can't drift as contribution rate grows. See CONTRIBUTING.md
+    # for the convention. Only runs on pull requests, where a base ref exists.
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Require CHANGELOG entry for contract changes
+        run: |
+          BASE="origin/${{ github.base_ref }}"
+          git fetch --no-tags origin "${{ github.base_ref }}"
+          CHANGED=$(git diff --name-only "$BASE...HEAD")
+          echo "Changed files:"
+          echo "$CHANGED"
+          if echo "$CHANGED" | grep -qE '^contracts/'; then
+            if ! echo "$CHANGED" | grep -qE '^CHANGELOG\.md$'; then
+              echo "::error::This PR touches contracts/ but does not modify CHANGELOG.md. Add an entry under the Unreleased section (see CONTRIBUTING.md)."
+              exit 1
+            fi
+          fi
+          echo "Changelog check passed."
+
   test:
     runs-on: ubuntu-latest
     steps:

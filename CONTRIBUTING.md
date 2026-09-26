@@ -53,6 +53,32 @@ This funds the identity, builds, deploys and initializes all four contracts,
 approves the issuer on compliance, deploys a sample asset, and registers it.
 Copy the printed contract ids into [DEPLOYMENTS.md](DEPLOYMENTS.md).
 
+## Changelog convention
+
+Every change that touches contract source (`contracts/**`) must come with a
+`CHANGELOG.md` entry — updating the changelog is part of the definition of done.
+CI flags any pull request that modifies `contracts/**` without also modifying
+`CHANGELOG.md`.
+
+Add your entry under the `## [Unreleased]` heading, in the appropriate
+subsection (`Added`, `Changed`, `Deprecated`, `Removed`, `Fixed`, `Security`),
+using the [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) format:
+
+```markdown
+## [Unreleased]
+
+### Added
+- `compliance`: block transfers to sanctioned jurisdictions (#123)
+```
+
+Guidelines:
+
+- One bullet per user-visible change; reference the issue or PR number.
+- Prefix the bullet with the affected contract or area (e.g. `asset-token:`).
+- Keep entries concise and written for integrators, not for the diff.
+- When a release is cut, move the `Unreleased` entries under a new version
+  heading with the release date.
+
 ## The compliance model & cross-contract calls
 
 The **compliance** contract is the source of truth for who may hold or transfer
