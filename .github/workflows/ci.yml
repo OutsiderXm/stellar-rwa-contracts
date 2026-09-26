@@ -75,6 +75,22 @@ jobs:
       - name: Build contracts (wasm)
         run: cargo build --workspace --release --target wasm32v1-none
 
+      # Issue #374: Track WASM contract sizes
+      - name: Report WASM contract sizes
+        run: |
+          echo "## Contract WASM Sizes" >> $GITHUB_STEP_SUMMARY
+          for contract in compliance asset-token registry dividend; do
+            wasm_file="target/wasm32v1-none/release/${contract}.wasm"
+            if [ -f "$wasm_file" ]; then
+              size=$(wc -c < "$wasm_file")
+              size_kb=$((size / 1024))
+              echo "- **$contract**: ${size_kb}KB" >> $GITHUB_STEP_SUMMARY
+              if [ $size_kb -gt 500 ]; then
+                echo "  ⚠️  Exceeds 500KB threshold" >> $GITHUB_STEP_SUMMARY
+              fi
+            fi
+          done
+
   coverage:
     runs-on: ubuntu-latest
     steps:

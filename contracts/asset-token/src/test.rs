@@ -802,3 +802,81 @@ fn test_total_supply_tracks_mint_burn_mint_batch() {
     // The metadata-reported supply stays in lockstep with the direct ABI read.
     assert_eq!(s.token.get_metadata().total_supply, s.token.total_supply());
 }
+
+// Issue #376: Property test for supply conservation
+proptest! {
+    #[test]
+    fn prop_supply_conserved_after_operations(
+        mint_amounts in prop::collection::vec(1i128..100_000i128, 0..5),
+        burn_amount in 0i128..1_000_000i128,
+    ) {
+        let s = setup(1_000_000);
+        let initial_supply = s.token.total_supply();
+
+        let bob = Address::generate(&s.env);
+        approve(&s.env, &s.compliance, &s.admin, &bob);
+
+        for amount in mint_amounts {
+            s.token.mint(&s.admin, &bob, &amount);
+        }
+
+        let supply_after_mints = s.token.total_supply();
+        let bob_balance = s.token.balance(&bob);
+
+        if burn_amount <= s.token.balance(&s.admin) {
+            s.token.burn(&s.admin, &burn_amount);
+        }
+
+        let final_supply = s.token.total_supply();
+
+        // Check: sum of all balances equals total supply
+        let admin_balance = s.token.balance(&s.admin);
+        let sum_of_balances = admin_balance.saturating_add(bob_balance);
+
+        prop_assert_eq!(
+            final_supply, sum_of_balances,
+            "Supply conservation violated: total={}, sum_of_balances={}",
+            final_supply, sum_of_balances
+        );
+        Ok(())
+    }
+}
+
+// Issue #375: Property test for compliance transfer gate
+proptest! {
+    #[test]
+    fn prop_transfer_gate_enforced(
+        sender_approved in prop::bool::ANY,
+        recipient_approved in prop::bool::ANY,
+    ) {
+        let s = setup(1_000);
+        let sender = Address::generate(&s.env);
+        let recipient = Address::generate(&s.env);
+
+        if sender_approved {
+            approve(&s.env, &s.compliance, &s.admin, &sender);
+        }
+        if recipient_approved {
+            approve(&s.env, &s.compliance, &s.admin, &recipient);
+        }
+
+        // Mint to sender
+        if sender_approved {
+            s.token.mint(&s.admin, &sender, &100);
+        }
+
+        // Transfer succeeds only if BOTH are approved
+        let should_succeed = sender_approved && recipient_approved;
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            s.token.transfer(&sender, &recipient, &50);
+        }));
+
+        if should_succeed {
+            prop_assert!(result.is_ok(), "Transfer should succeed when both approved");
+        } else {
+            prop_assert!(result.is_err(), "Transfer should fail when either party not approved");
+        }
+        Ok(())
+    }
+}

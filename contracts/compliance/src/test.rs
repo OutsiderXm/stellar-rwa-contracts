@@ -381,3 +381,48 @@ fn test_prune_expired_removes_from_allowlist() {
     assert!(client.get_record(&user_expire).is_none());
     assert!(client.get_record(&user_persist).is_some());
 }
+
+// Issue #373: Test upgrade mechanism end-to-end with state preservation and authorization enforcement
+#[test]
+fn test_upgrade_preserves_state_and_enforces_admin() {
+    let (env, client, admin) = setup();
+    let user = Address::generate(&env);
+    let us = String::from_str(&env, "US");
+    let non_admin = Address::generate(&env);
+
+    // Pre-upgrade state: add users to allowlist
+    env.ledger().with_mut(|l| l.sequence_number = 10);
+    client.add_to_allowlist(&admin, &user, &us, &500);
+    let initial_list = client.get_allowlist();
+    assert_eq!(initial_list.len(), 1);
+
+    // Attempt upgrade by non-admin should fail
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        client.upgrade(&non_admin, &Vec::new(&env), &Vec::new(&env), &Vec::new(&env));
+    }));
+    assert!(
+        result.is_err(),
+        "Upgrade should fail when called by non-admin"
+    );
+
+    // Admin-initiated upgrade
+    client.upgrade(&admin, &Vec::new(&env), &Vec::new(&env), &Vec::new(&env));
+
+    // Post-upgrade: verify state is preserved
+    let post_upgrade_list = client.get_allowlist();
+    assert_eq!(
+        post_upgrade_list.len(),
+        initial_list.len(),
+        "Allowlist length must be preserved after upgrade"
+    );
+    assert_eq!(
+        post_upgrade_list.get(0).unwrap(),
+        user,
+        "User entry must be preserved after upgrade"
+    );
+
+    // Verify record details intact
+    let record = client.get_record(&user);
+    assert!(record.is_some(), "User record must exist after upgrade");
+}
+
