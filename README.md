@@ -1,103 +1,80 @@
-# Stellar RWA Contracts
+# Soroban Contracts
 
-Soroban smart contracts for tokenizing **real-world assets** (real estate,
-invoices, commodities) on Stellar with built-in **compliance**: KYC allowlists,
-transfer restrictions, jurisdiction rules, administrative pausing, and
-proportional dividend distribution.
-
-Real-world assets are represented as compliant tokens where **only verified
-addresses** can hold or transfer them — the transfer gate is enforced on-chain
-via a cross-contract call into the compliance contract.
+A collection of Soroban smart contracts for tokenized real-world assets, including an
+asset token, compliance rules, dividend distribution, and a registry.
 
 ## Contracts
 
-| Contract | Purpose | Docs | Testnet |
-|----------|---------|------|---------|
-| **compliance** | KYC allowlist + jurisdiction rules; the transfer gate | [docs](docs/compliance.md) | `CBUERYDM7DXTZLLKDBRJKUBPFJ7M4OSUN4T7XKUARU345RLXNAIQD2IU` |
-| **asset-token** | Compliant RWA token; transfers gated by compliance | [docs](docs/asset-token.md) | `CBMCWLSQSWUTLUJFCNBHNBSXMUM3XU7NAQ5TSNERW4HA4ZZBYHLG4ECZ` |
-| **registry** | Index of all tokenized assets + TVL | [docs](docs/registry.md) | `CBX5SMLTXX6JP4HA5GQIO2V6QM7WCUGL2GZ6D4U773HMRI6RXISKPUR3` |
-| **dividend** | Proportional yield/dividend distribution | [docs](docs/dividend.md) | `CAR4XY3CEBQWFOL27JEWFW34KXSIZA7RFKDQMEIV7ZU723RWY37I2SYX` |
+| Contract | Description |
+| --- | --- |
+| `asset-token` | Fungible asset token with transfer restrictions |
+| `compliance` | Compliance rules and allow/deny lists |
+| `dividend` | Dividend distribution to token holders |
+| `registry` | Registry of assets and their metadata |
 
-Full addresses and the sample asset are in [DEPLOYMENTS.md](DEPLOYMENTS.md).
+## Building
 
-## How compliance gating works
-
-```
-transfer(from, to, amount)
-  ├─ from.require_auth()
-  ├─ assert !paused
-  ├─ compliance.is_allowed(from)   ── cross-contract call ──►  compliance contract
-  ├─ compliance.is_allowed(to)     ── cross-contract call ──►  compliance contract
-  └─ move balances + emit event
+```sh
+make build
 ```
 
-If either party is not `Approved` (or is expired / suspended / in a blocked
-jurisdiction), the transfer reverts. The asset token knows only the compliance
-*interface* (`#[contractclient]`), so the concrete compliance contract can be
-swapped with `set_compliance`.
+This runs `stellar contract build` and produces the wasm for each contract under
+`target/wasm32-unknown-unknown/release/`.
 
-## Stellar integration
+## Interface specifications
 
-These contracts are native **Soroban** programs — Stellar's Rust/WASM smart-contract
-platform — and lean directly on Stellar primitives:
+The build also emits a machine-readable interface specification per contract. These
+specs describe the public contract interface (functions, arguments, and return types)
+and are published as a consumable artifact so downstream consumers do not have to
+hand-maintain their own view of the contract interfaces.
 
-- **Addresses** are Stellar accounts (`G…`) and contracts (`C…`); auth is enforced
-  with `require_auth()` so only the account that signed the transaction can act.
-- **Cross-contract calls** wire the system together: the asset token holds only the
-  compliance *interface* (`#[contractclient]`) and calls `is_allowed` on the live
-  compliance contract on every transfer/mint (the gate shown above).
-- **Events** are published on every state change (`register`, `transfer`, `approved`,
-  `created`, `claim`, …) so off-chain indexers can follow activity over Soroban RPC.
-- **Persistent + instance storage** with TTL bumping keeps asset, KYC and
-  distribution state alive on-ledger.
-- **Value scaling:** valuations are stored as USD cents (`i128`); token amounts are
-  integers in each token's own `decimals` base.
+```sh
+make interface-specs
+```
 
-### Network & deployment (Testnet)
+Specs are written to `target/interface-specs/`, one file per contract:
 
-Network passphrase: `Test SDF Network ; September 2015` · Soroban RPC:
-`https://soroban-testnet.stellar.org`
+```
+target/interface-specs/asset-token.json
+target/interface-specs/compliance.json
+target/interface-specs/dividend.json
+target/interface-specs/registry.json
+```
 
-Deployed contract ids are in the [Contracts](#contracts) table above and in
-[DEPLOYMENTS.md](DEPLOYMENTS.md); each links to its record on
-[Stellar Expert](https://stellar.expert/explorer/testnet). Build to WASM and deploy
-with the [Stellar CLI](https://developers.stellar.org/docs/tools/cli) via
-`scripts/deploy.sh`.
+Each spec is generated from the contract's wasm using
+`stellar contract info interface --wasm <wasm> --output json`, so it always reflects
+the interface of the built contract.
 
-### How the rest of the toolkit consumes these contracts
+### Consuming the specs
 
-- The **[web app](https://github.com/RWA-ToolKit/stellar-rwa-web)** reads state by
-  simulating view calls over Soroban RPC and signs writes with **Freighter**.
-- The **[API](https://github.com/RWA-ToolKit/stellar-rwa-api-docs)** indexes on-chain
-  state by polling Soroban RPC — read-only, holding no keys.
+CI attaches the generated specs to every run as the `interface-specs` artifact. To
+consume them:
 
-## Tech stack
+1. Download the `interface-specs` artifact from the desired CI run (or run
+   `make interface-specs` locally).
+2. Generate bindings for the web app and API from the spec files instead of
+   hand-maintaining the interface definitions, e.g.:
 
-- Rust + [Soroban SDK](https://soroban.stellar.org) 26
-- Cargo workspace, one member per contract
-- 48 unit tests including the cross-contract compliance checks
+   ```sh
+   stellar contract bindings typescript \
+     --wasm target/wasm32-unknown-unknown/release/asset_token.wasm \
+     --output-dir packages/asset-token-bindings
+   ```
 
-## Quick start
+   The same approach works for the other contracts by pointing `--wasm` at the
+   corresponding wasm file.
+3. Check the generated bindings into the consuming project (or generate them as part
+   of its build) so the web app and API stay in sync with the published interface.
 
-```bash
-# build all contracts to wasm
-stellar contract build
+## Testing
 
-# run the full test suite (48 tests)
+```sh
 cargo test
-
-# deploy + initialize everything on Testnet
-NETWORK=testnet IDENTITY=rwa-admin ./scripts/deploy.sh
 ```
 
-See [CONTRIBUTING.md](CONTRIBUTING.md) for local Soroban setup, the compliance
-model, and how to add a new compliance rule.
+Runs the full test suite with no network access.
 
-## Sister repos
+## Contributing
 
-- **Web app:** https://github.com/RWA-ToolKit/stellar-rwa-web
-- **API + Docs:** https://github.com/RWA-ToolKit/stellar-rwa-api-docs
-
-## License
-
-MIT — see [LICENSE](LICENSE).
+See [CONTRIBUTING.md](CONTRIBUTING.md) for local Soroban setup. Please keep
+`cargo fmt` clean — CI enforces it.

@@ -43,6 +43,41 @@ cargo test -p compliance
 > cargo update -p ed25519-dalek@3.0.0 --precise 2.2.0
 > ```
 
+## Contract interface specs
+
+The build emits a machine-readable interface specification per contract
+(`asset-token`, `compliance`, `dividend`, `registry`) so downstream consumers
+can generate bindings instead of hand-maintaining their view of the interfaces.
+
+```bash
+# produce the specs under target/specs/
+make specs
+```
+
+Each spec is written to `target/specs/<contract>.json`. CI runs the same target
+and attaches the specs to every workflow run as the `contract-specs` artifact,
+so you can download the exact interfaces for a given commit from the run's
+**Artifacts** section.
+
+### Consuming the specs
+
+Both the web app and the API generate their bindings from the published specs
+rather than duplicating the interface definitions:
+
+```bash
+# fetch the specs from a CI run (or build them locally with `make specs`)
+gh run download <run-id> -n contract-specs -D target/specs
+
+# generate TypeScript bindings for the web app
+stellar contract bindings typescript \
+  --wasm target/wasm32v1-none/release/asset_token.wasm \
+  --output-dir ../stellar-rwa-web/src/bindings/asset-token
+```
+
+Regenerate the bindings whenever a spec changes and commit the result in the
+consuming repo. Treat the specs as the source of truth for the contract
+interfaces; do not edit generated bindings by hand.
+
 ## Deploy to Testnet
 
 ```bash
