@@ -101,3 +101,8 @@ model, and how to add a new compliance rule.
 ## License
 
 MIT — see [LICENSE](LICENSE).
+
+## Handsoff notes
+
+<!-- handsoff-issue-390 -->
+- #390: Test concurrent claims against the same distribution
