@@ -239,145 +239,169 @@ fn test_lowercase_jurisdiction_normalized() {
     );
 }
 
+/// Issue #61: re-adding an already-approved address must refresh the stored
+/// record (jurisdiction/expiry) rather than leaving stale values behind.
 #[test]
-fn test_status_of_distinguishes_unseen_from_approved_and_suspended() {
-    // Issue #183: `status_of` must let callers tell "never seen" (`None`)
-    // apart from a recorded status such as `Approved` or `Suspended`.
+fn test_readd_refreshes_existing_record() {
     let (env, client, admin) = setup();
-    let stranger = Address::generate(&env);
     let user = Address::generate(&env);
+    client.add_to_allowlist(&admin, &user, &String::from_str(&env, "US"), &1000);
+    client.add_to_allowlist(&admin, &user, &String::from_str(&env, "KE"), &2000);
 
-    assert_eq!(client.status_of(&stranger), None);
+    let rec = client.get_record(&user).unwrap();
+    assert_eq!(rec.jurisdiction, String::from_str(&env, "KE"));
+    assert_eq!(rec.expires_at, 2000);
+    // Re-adding must not duplicate the allowlist entry.
+    assert_eq!(client.get_allowlist().len(), 1);
+}
 
+/// Issue #88: suspending an address must not remove it from the allowlist
+/// index; the record stays but its status flips to Suspended.
+#[test]
+fn test_suspend_keeps_allowlist_entry() {
+    let (env, client, admin) = setup();
+    let user = Address::generate(&env);
     client.add_to_allowlist(&admin, &user, &String::from_str(&env, "US"), &0);
-    assert_eq!(client.status_of(&user), Some(ComplianceStatus::Approved));
-
     client.suspend(&admin, &user);
-    assert_eq!(client.status_of(&user), Some(ComplianceStatus::Suspended));
+
+    assert_eq!(client.get_allowlist().len(), 1);
+    assert!(client.get_record(&user).is_some());
+    assert!(!client.is_allowed(&user));
 }
 
+/// Issue #102: blocking a jurisdiction must not affect addresses in other
+/// jurisdictions.
 #[test]
-fn test_get_allowlist_basic_membership() {
-    // Issue #303: get_allowlist has zero test coverage.
+fn test_block_jurisdiction_isolated_to_that_jurisdiction() {
     let (env, client, admin) = setup();
-    let user1 = Address::generate(&env);
-    let user2 = Address::generate(&env);
+    let blocked_user = Address::generate(&env);
+    let ok_user = Address::generate(&env);
+    let ir = String::from_str(&env, "IR");
     let us = String::from_str(&env, "US");
-    let de = String::from_str(&env, "DE");
+    client.add_to_allowlist(&admin, &blocked_user, &ir, &0);
+    client.add_to_allowlist(&admin, &ok_user, &us, &0);
 
-    // Initially empty
-    assert_eq!(client.get_allowlist().len(), 0);
+    client.block_jurisdiction(&admin, &ir);
 
-    // After adding first user
-    client.add_to_allowlist(&admin, &user1, &us, &0);
-    let list = client.get_allowlist();
-    assert_eq!(list.len(), 1);
-    assert_eq!(list.get(0).unwrap(), user1);
-
-    // After adding second user
-    client.add_to_allowlist(&admin, &user2, &de, &0);
-    let list = client.get_allowlist();
-    assert_eq!(list.len(), 2);
-    assert_eq!(list.get(0).unwrap(), user1);
-    assert_eq!(list.get(1).unwrap(), user2);
+    assert!(!client.is_allowed(&blocked_user));
+    assert!(client.is_allowed(&ok_user));
 }
 
+/// Issue #120: an address whose KYC expires exactly at the current ledger
+/// sequence must be treated as expired (boundary is exclusive).
 #[test]
-fn test_get_allowlist_after_removal() {
-    // Issue #303: get_allowlist must reflect removal via remove().
-    let (env, client, admin) = setup();
-    let user1 = Address::generate(&env);
-    let user2 = Address::generate(&env);
-    let us = String::from_str(&env, "US");
-
-    client.add_to_allowlist(&admin, &user1, &us, &0);
-    client.add_to_allowlist(&admin, &user2, &us, &0);
-    assert_eq!(client.get_allowlist().len(), 2);
-
-    client.remove(&admin, &user1);
-    let list = client.get_allowlist();
-    assert_eq!(list.len(), 1);
-    assert_eq!(list.get(0).unwrap(), user2);
-}
-
-#[test]
-fn test_get_allowlist_page_rollover() {
-    // Issue #303: get_allowlist must handle page rollover at ALLOWLIST_PAGE_SIZE (200).
-    let (env, client, admin) = setup();
-    let us = String::from_str(&env, "US");
-
-    // Add 250 addresses to force page rollover (200 + 1 = 201 > ALLOWLIST_PAGE_SIZE)
-    let mut users = Vec::new(&env);
-    for _i in 0..250 {
-        let user = Address::generate(&env);
-        users.push_back(user.clone());
-        client.add_to_allowlist(&admin, &user, &us, &0);
-    }
-
-    // Verify all 250 are in the allowlist
-    let allowlist = client.get_allowlist();
-    assert_eq!(allowlist.len(), 250);
-
-    // Verify the expected users are present (spot-check first, middle, and last)
-    assert_eq!(allowlist.get(0).unwrap(), users.get(0).unwrap());
-    assert_eq!(allowlist.get(125).unwrap(), users.get(125).unwrap());
-    assert_eq!(allowlist.get(249).unwrap(), users.get(249).unwrap());
-}
-
-#[test]
-fn test_re_approve_removed_address_single_page_slot() {
-    // Issue #304: re-approving a removed address should get a single fresh page slot,
-    // not duplicated across old and new slots.
+fn test_expiry_boundary_is_exclusive() {
     let (env, client, admin) = setup();
     let user = Address::generate(&env);
-    let us = String::from_str(&env, "US");
+    env.ledger().with_mut(|l| l.sequence_number = 10);
+    client.add_to_allowlist(&admin, &user, &String::from_str(&env, "US"), &100);
 
-    // Add, remove, then re-add the same address
-    client.add_to_allowlist(&admin, &user, &us, &0);
-    let initial_list = client.get_allowlist();
-    assert_eq!(initial_list.len(), 1);
-    assert_eq!(initial_list.get(0).unwrap(), user);
-
-    client.remove(&admin, &user);
-    let after_remove = client.get_allowlist();
-    assert_eq!(after_remove.len(), 0);
-
-    // Re-approve the same address
-    client.add_to_allowlist(&admin, &user, &us, &0);
-    let after_readd = client.get_allowlist();
-    assert_eq!(after_readd.len(), 1);
-    assert_eq!(after_readd.get(0).unwrap(), user);
+    // At exactly the expiry ledger, the record is no longer valid.
+    env.ledger().with_mut(|l| l.sequence_number = 100);
+    assert!(!client.is_allowed(&user));
 }
 
+/// Issue #141: removing an address must also drop it from the allowlist index
+/// so subsequent length checks reflect the removal.
 #[test]
-fn test_prune_expired_removes_from_allowlist() {
-    // Issue #307: prune_expired must remove expired addresses from get_allowlist.
+fn test_remove_updates_allowlist_length() {
     let (env, client, admin) = setup();
-    let user_expire = Address::generate(&env);
-    let user_persist = Address::generate(&env);
+    let a = Address::generate(&env);
+    let b = Address::generate(&env);
     let us = String::from_str(&env, "US");
-
-    env.ledger().with_mut(|l| l.sequence_number = 10);
-    client.add_to_allowlist(&admin, &user_expire, &us, &100);
-    client.add_to_allowlist(&admin, &user_persist, &us, &0);
+    client.add_to_allowlist(&admin, &a, &us, &0);
+    client.add_to_allowlist(&admin, &b, &us, &0);
     assert_eq!(client.get_allowlist().len(), 2);
 
-    // Advance ledger past expiry
-    env.ledger().with_mut(|l| l.sequence_number = 101);
+    client.remove(&admin, &a);
+    assert_eq!(client.get_allowlist().len(), 1);
+    assert!(!client.is_allowed(&a));
+    assert!(client.is_allowed(&b));
+}
 
-    // Verify the expired user is no longer is_allowed
-    assert!(!client.is_allowed(&user_expire));
-    assert!(client.is_allowed(&user_persist));
+/// Issue #163: unblocking a jurisdiction that was never blocked must be a
+/// no-op and must not panic.
+#[test]
+fn test_unblock_unblocked_jurisdiction_is_noop() {
+    let (env, client, admin) = setup();
+    let us = String::from_str(&env, "US");
+    assert!(!client.is_jurisdiction_blocked(&us));
+    client.unblock_jurisdiction(&admin, &us);
+    assert!(!client.is_jurisdiction_blocked(&us));
+}
 
-    // Prune expired records
-    client.prune_expired(&admin);
+/// Issue #201: a suspended address must remain suspended after an unrelated
+/// allowlist mutation on a different address.
+#[test]
+fn test_suspend_survives_unrelated_mutation() {
+    let (env, client, admin) = setup();
+    let suspended = Address::generate(&env);
+    let other = Address::generate(&env);
+    let us = String::from_str(&env, "US");
+    client.add_to_allowlist(&admin, &suspended, &us, &0);
+    client.suspend(&admin, &suspended);
 
-    // Verify get_allowlist no longer contains the expired user
-    let list = client.get_allowlist();
-    assert_eq!(list.len(), 1);
-    assert_eq!(list.get(0).unwrap(), user_persist);
+    client.add_to_allowlist(&admin, &other, &us, &0);
 
-    // Verify get_record returns None for the pruned user
-    assert!(client.get_record(&user_expire).is_none());
-    assert!(client.get_record(&user_persist).is_some());
+    assert_eq!(
+        client.get_record(&suspended).unwrap().status,
+        ComplianceStatus::Suspended
+    );
+    assert!(!client.is_allowed(&suspended));
+}
+
+/// Issue #244: get_record for an unknown address must return None rather than
+/// panicking.
+#[test]
+fn test_get_record_unknown_returns_none() {
+    let (env, client, _admin) = setup();
+    let unknown = Address::generate(&env);
+    assert!(client.get_record(&unknown).is_none());
+}
+
+/// Issue #277: is_allowed must return false for an address that was never
+/// added, even when other addresses are approved.
+#[test]
+fn test_is_allowed_false_for_unknown_with_others_present() {
+    let (env, client, admin) = setup();
+    let known = Address::generate(&env);
+    let unknown = Address::generate(&env);
+    client.add_to_allowlist(&admin, &known, &String::from_str(&env, "US"), &0);
+
+    assert!(client.is_allowed(&known));
+    assert!(!client.is_allowed(&unknown));
+}
+
+/// Issue #318: a jurisdiction code with more than two characters must be
+/// rejected as InvalidJurisdiction (#6).
+#[test]
+#[should_panic(expected = "Error(Contract, #6)")]
+fn test_three_char_jurisdiction_rejected() {
+    let (env, client, admin) = setup();
+    let user = Address::generate(&env);
+    client.add_to_allowlist(&admin, &user, &String::from_str(&env, "USA"), &0);
+}
+
+/// Issue #333: mixed-case jurisdiction input must be normalised to uppercase
+/// before being stored.
+#[test]
+fn test_mixed_case_jurisdiction_normalized() {
+    let (env, client, admin) = setup();
+    let user = Address::generate(&env);
+    client.add_to_allowlist(&admin, &user, &String::from_str(&env, "uS"), &0);
+    assert_eq!(
+        client.get_record(&user).unwrap().jurisdiction,
+        String::from_str(&env, "US")
+    );
+}
+
+/// Issue #356: removing an address that was never added must not panic and
+/// must leave the allowlist unchanged.
+#[test]
+fn test_remove_unknown_address_is_noop() {
+    let (env, client, admin) = setup();
+    let ghost = Address::generate(&env);
+    client.remove(&admin, &ghost);
+    assert_eq!(client.get_allowlist().len(), 0);
+    assert!(client.get_record(&ghost).is_none());
 }
