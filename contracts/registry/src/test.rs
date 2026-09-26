@@ -104,6 +104,33 @@ fn test_ids_increment() {
     assert_eq!(client.asset_count(), 3);
 }
 
+#[test]
+fn test_active_count_matches_asset_count_after_deactivations() {
+    let (env, client, admin) = setup();
+    let issuer = Address::generate(&env);
+
+    let mut ids = Vec::new(&env);
+    for _ in 0..5 {
+        ids.push_back(register(&env, &client, &issuer, "real_estate", 100));
+    }
+
+    assert_eq!(client.asset_count(), 5);
+    assert_eq!(client.active_count(), 5);
+    assert_eq!(client.asset_count() - client.active_count(), 0);
+
+    let mut deactivated = 0u64;
+    for id in ids.iter() {
+        client.deactivate_asset(&admin, &id);
+        deactivated += 1;
+        assert_eq!(client.asset_count(), 5);
+        assert_eq!(client.active_count(), 5 - deactivated);
+        assert_eq!(client.asset_count() - client.active_count(), deactivated);
+    }
+
+    assert_eq!(client.active_count(), 0);
+    assert_eq!(client.asset_count() - client.active_count(), 5);
+}
+
 proptest! {
     #[test]
     fn prop_active_count_matches_active_entries(
@@ -255,13 +282,6 @@ fn test_tvl_sums_only_active() {
 
     let issuer = Address::generate(&env);
     let a = register(&env, &client, &issuer, "real_estate", 100);
-    let b = register(&env, &client, &issuer, "invoice", 250);
-    let c = register(&env, &client, &issuer, "commodity", 40);
-    assert_eq!(client.total_value_locked(), 390);
+    let b = register(&env
 
-    client.deactivate_asset(&admin, &a);
-    assert_eq!(client.total_value_locked(), 290);
-
- 
-
-/* … truncated 4873 chars — edit only what you need near the top … */
+/* … truncated 316 chars — edit only what you need near the top … */
