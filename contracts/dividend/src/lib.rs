@@ -151,6 +151,10 @@ impl DividendContract {
         if total_amount <= 0 {
             panic_err(&env, Error::InvalidAmount);
         }
+        // Reject distributions with empty eligible set (issue #365).
+        if eligible.len() == 0 {
+            panic_err(&env, Error::InvalidAmount);
+        }
         // Reject distributions where no holder can ever claim (issue #49).
         let supply = AssetClient::new(&env, &asset_token).total_supply();
         if supply <= 0 {
@@ -314,6 +318,34 @@ impl DividendContract {
         bump(&env);
         env.events()
             .publish((symbol_short!("claim"), holder), (distribution_id, amount));
+    }
+
+    /// Cancel a distribution and return escrowed funds to the issuer.
+    /// Only works while nothing has been claimed (distributed == 0). Admin only.
+    pub fn cancel_distribution(env: Env, admin: Address, distribution_id: u64) {
+        Self::require_admin(&env, &admin);
+        let dist = Self::load(&env, distribution_id);
+        // Only allow cancellation before any claim is made (issue #366).
+        if dist.distributed > 0 {
+            panic_err(&env, Error::InvalidAmount);
+        }
+        // Return escrowed funds to the issuer.
+        let this = env.current_contract_address();
+        TokenClient::new(&env, &dist.payment_token).transfer(&this, &admin, &dist.total_amount);
+        // Mark as completed so no further claims are possible.
+        let mut cancelled_dist = dist;
+        cancelled_dist.completed = true;
+        env.storage()
+            .persistent()
+            .set(&DataKey::Dist(distribution_id), &cancelled_dist);
+        env.storage().persistent().extend_ttl(
+            &DataKey::Dist(distribution_id),
+            INSTANCE_LIFETIME_THRESHOLD,
+            INSTANCE_BUMP_AMOUNT,
+        );
+        bump(&env);
+        env.events()
+            .publish((symbol_short!("cancel"), admin), distribution_id);
     }
 
     /// Fetch a distribution by id.
