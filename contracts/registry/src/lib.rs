@@ -213,6 +213,14 @@ impl RegistryContract {
     /// whole registry.
     /// Note: This includes both active and deactivated assets. Deactivated assets
     /// are never removed from the index; use the `active` field to filter if needed.
+    ///
+    /// Matching is **byte-exact**: the index key is the `asset_type` string as
+    /// stored on the entry at registration time, so lookups are case-sensitive
+    /// and whitespace-sensitive. `"real_estate"`, `"Real_Estate"` and
+    /// `"real_estate "` are three distinct index keys; since only the values
+    /// in `VALID_ASSET_TYPES` can ever be registered (see
+    /// `validate_asset_type`), a query must match one of those canonical
+    /// strings exactly to return any results.
     pub fn get_assets_by_type(env: Env, asset_type: String) -> Vec<AssetEntry> {
         let ids = Self::index_ids(&env, &DataKey::TypeIndex(asset_type));
         Self::fetch_assets(&env, &ids)
@@ -287,6 +295,59 @@ impl RegistryContract {
         bump(&env);
         env.events()
             .publish((symbol_short!("deactvate"),), asset_id);
+    }
+
+    /// Reactivate a previously deactivated asset. Admin only. Included in TVL
+    /// and `active_count` again afterwards. Does nothing if the asset is
+    /// already active (no event emitted).
+    ///
+    /// Deactivation is not treated as final: assets are sometimes deactivated
+    /// by mistake (wrong id, premature admin action), and re-registering under
+    /// a new id would break existing references to the original one (issuer
+    /// index, type index, external links). Reactivation restores the same
+    /// entry in place instead.
+    pub fn reactivate_asset(env: Env, admin: Address, asset_id: u64) {
+        Self::require_admin(&env, &admin);
+        let mut entry: AssetEntry = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Asset(asset_id))
+            .unwrap_or_else(|| panic_err(&env, Error::AssetNotFound));
+        if entry.active {
+            return;
+        }
+        entry.active = true;
+        env.storage()
+            .persistent()
+            .set(&DataKey::Asset(asset_id), &entry);
+        env.storage().persistent().extend_ttl(
+            &DataKey::Asset(asset_id),
+            INSTANCE_LIFETIME_THRESHOLD,
+            INSTANCE_BUMP_AMOUNT,
+        );
+        let active_count: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::ActiveCount)
+            .unwrap_or(0u64)
+            + 1;
+        env.storage()
+            .instance()
+            .set(&DataKey::ActiveCount, &active_count);
+        let tvl: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::TotalValuation)
+            .unwrap_or(0);
+        let new_tvl = tvl
+            .checked_add(entry.valuation)
+            .unwrap_or_else(|| panic_err(&env, Error::Overflow));
+        env.storage()
+            .instance()
+            .set(&DataKey::TotalValuation, &new_tvl);
+        bump(&env);
+        env.events()
+            .publish((symbol_short!("reactvate"),), asset_id);
     }
 
     /// Sum of valuations across all active assets, in USD cents. Maintained
