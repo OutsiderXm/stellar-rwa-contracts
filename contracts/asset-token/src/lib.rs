@@ -8,7 +8,9 @@
 //! addresses can ever hold the asset.
 //!
 //! Valuation is stored in USD cents (`i128`). Amounts are integer token units in
-//! the token's own `decimals` base.
+//! the token's own `decimals` base. A zero-decimal token therefore cannot
+//! represent fractional token units; downstream proportional calculations can
+//! floor small claims to zero.
 
 #[cfg(test)]
 extern crate std;
@@ -369,6 +371,12 @@ impl AssetTokenContract {
     }
 
     /// Update the recorded USD-cents valuation. Admin only.
+    ///
+    /// This updates only the token metadata. If this token is also registered
+    /// in the registry, the registry's valuation is an independent snapshot
+    /// from registration and is not updated by this call. Clients and
+    /// operators must use a separate registry update workflow when they need
+    /// the records to agree; the current registry API has no update hook.
     pub fn update_valuation(env: Env, admin: Address, new_valuation: i128) {
         let mut meta = Self::require_admin(&env, &admin);
         if new_valuation < 0 {

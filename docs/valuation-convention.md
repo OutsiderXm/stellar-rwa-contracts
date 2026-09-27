@@ -24,9 +24,18 @@ cents_to_dollars(10_050) = 100.5
 
 ## In Registry Contract
 
-`set_valuation(asset_id, 50000)` means **$500.00** (50,000 cents)
+`register_asset(..., 50000)` stores **$500.00** (50,000 cents)
 
 All queries return cents. Convert on client side if needed.
+
+## Token and Registry Consistency
+
+The asset token and registry store separate valuation fields. Registering an
+asset copies the supplied valuation into the registry, but the registry does
+not observe `asset-token::update_valuation`. Updating the token metadata can
+therefore leave the registry entry and TVL stale. Divergence is possible until
+the registry gains a valuation-update workflow; clients and operators must
+verify both records and coordinate any separate registry correction.
 
 ## In Documentation
 

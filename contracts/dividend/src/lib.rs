@@ -10,6 +10,10 @@
 //! entitlement is sized against this snapshot rather than live balances, preventing
 //! post-creation transfers from inflating or diluting any holder's claim.
 //! `created_at` records the ledger at which the distribution was created for reference.
+//!
+//! Entitlements use integer token units and integer division. If the asset token
+//! has zero decimals, it cannot represent fractional holdings, and a small
+//! proportional payment may round down to zero and be unclaimable.
 
 #[cfg(test)]
 extern crate std;
@@ -262,7 +266,8 @@ impl DividendContract {
         if basis <= 0 {
             return 0;
         }
-        // Proportional share, floored by integer division. Guard the
+        // Proportional share, floored by integer division. For zero-decimal
+        // asset tokens this can make small claims equal to zero. Guard the
         // multiplication against i128 overflow (issue #165).
         dist.total_amount
             .checked_mul(basis)

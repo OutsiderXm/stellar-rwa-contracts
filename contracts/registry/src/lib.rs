@@ -91,6 +91,13 @@ impl RegistryContract {
     }
 
     /// Register a new tokenized asset. The issuer must authorize the call.
+    ///
+    /// `valuation` is copied into the registry entry and TVL at registration
+    /// time. It is independent from any valuation stored by the token
+    /// contract: the registry has no callback or synchronization hook when a
+    /// token updates its metadata valuation. Divergence is therefore possible
+    /// and callers must verify both records; the current registry API has no
+    /// valuation-update entrypoint.
     /// Returns the assigned asset id.
     pub fn register_asset(
         env: Env,

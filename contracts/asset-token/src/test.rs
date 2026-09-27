@@ -368,6 +368,8 @@ fn test_mint_succeeds_after_unpause() {
 #[test]
 fn test_update_valuation() {
     let s = setup(1_000);
+    // Valuation is local token metadata; a separately registered valuation is
+    // not synchronized by this call.
     s.token.update_valuation(&s.admin, &75_000_000);
     assert_eq!(s.token.get_metadata().valuation, 75_000_000);
 }

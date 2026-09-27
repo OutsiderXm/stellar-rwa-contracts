@@ -14,8 +14,11 @@ At claim time a holder can claim:
 claimable = total_amount * balance(holder) / total_supply
 ```
 
-where `balance` and `total_supply` are read live from the asset token. Integer
-division floors the result. Each holder can claim a given distribution **once**.
+where `balance` and `total_supply` are represented in the asset token's raw
+integer units. Integer division floors the result. With an asset token using
+zero decimals, fractional holdings cannot be represented and a small claim can
+round to zero, making it unclaimable. Each holder can claim a given
+distribution **once**.
 
 ## `Distribution`
 

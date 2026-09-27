@@ -148,6 +148,33 @@ fn test_claim_is_proportional() {
     assert_eq!(ctx.dividend.get_distribution(&id).distributed, 300);
 }
 
+// A zero-decimal asset token has integer-only holdings. A payment smaller than
+// the snapshot denominator can therefore produce a zero proportional claim.
+#[test]
+fn test_zero_decimal_asset_small_claim_rounds_to_zero() {
+    let ctx = setup();
+    assert_eq!(
+        AssetTokenContractClient::new(&ctx.env, &ctx.asset_id)
+            .get_metadata()
+            .decimals,
+        0
+    );
+
+    let snapshot = Vec::from_array(
+        &ctx.env,
+        [
+            (ctx.h1.clone(), 1i128),
+            (ctx.h2.clone(), 999i128),
+        ],
+    );
+    let id = ctx
+        .dividend
+        .create_distribution(&ctx.admin, &ctx.asset_id, &ctx.pay_id, &1, &snapshot);
+
+    // 1 payment unit * 1 asset unit / 1000 snapshot units floors to zero.
+    assert_eq!(ctx.dividend.claimable(&id, &ctx.h1), 0);
+}
+
 proptest! {
     #[test]
     fn prop_distribution_claims_never_exceed_proportional_share(
