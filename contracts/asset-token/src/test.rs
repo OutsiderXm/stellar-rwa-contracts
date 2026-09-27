@@ -802,3 +802,74 @@ fn test_total_supply_tracks_mint_burn_mint_batch() {
     // The metadata-reported supply stays in lockstep with the direct ABI read.
     assert_eq!(s.token.get_metadata().total_supply, s.token.total_supply());
 }
+
+// ---- extreme `decimals` documentation test ----
+//
+// `initialize` accepts any `u32` for `decimals` with no upper-bound
+// validation. `decimals` is stored as opaque metadata by this contract and is
+// never used in on-chain arithmetic here (balances/`total_supply` are raw
+// `i128` units, independent of `decimals`), so a huge `decimals` value does
+// not by itself overflow anything inside asset-token. The risk is entirely
+// downstream: a consumer (e.g. a UI, or another contract computing
+// `total_amount * basis` scaled by `10^decimals`, as `dividend` effectively
+// does when interpreting amounts) that treats `decimals` as bounded (e.g.
+// `<= 18`, matching typical token conventions) could overflow or produce
+// nonsensical results. This test documents *current* behavior: `initialize`
+// happily accepts `decimals = 255` (u8::MAX, an extreme but valid `u32`)
+// alongside a large `total_supply` and `valuation`, and all reads
+// (`get_metadata`, `total_supply`, `balance`) remain internally consistent.
+// If an upper bound is added later (closing this gap), this test's
+// expectations should change from "accepted" to "rejected".
+#[test]
+fn test_extreme_decimals_accepted_with_large_supply_and_valuation() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let compliance_id = env.register(ComplianceContract, ());
+    let compliance = ComplianceContractClient::new(&env, &compliance_id);
+    let admin = Address::generate(&env);
+    compliance.initialize(&admin);
+    approve(&env, &compliance, &admin, &admin);
+
+    let token_id = env.register(AssetTokenContract, ());
+    let token = AssetTokenContractClient::new(&env, &token_id);
+
+    // A supply and valuation near the top of what `i128` can represent,
+    // combined with an extreme decimals value, to probe for overflow or
+    // inconsistent reads in asset-token's own storage/arithmetic.
+    let huge_supply: i128 = 170_141_183_460_469_231_731_687_303_715_884_105_727 / 2;
+    let huge_valuation: i128 = huge_supply;
+    let extreme_decimals: u32 = 255;
+
+    token.initialize(
+        &admin,
+        &String::from_str(&env, "Extreme Decimals Asset"),
+        &String::from_str(&env, "XTRM"),
+        &String::from_str(&env, "real_estate"),
+        &huge_supply,
+        &extreme_decimals,
+        &compliance_id,
+        &String::from_str(&env, "Documents current no-upper-bound decimals behavior"),
+        &huge_valuation,
+    );
+
+    // `initialize` did not panic or clamp `decimals`; it is stored verbatim.
+    let meta = token.get_metadata();
+    assert_eq!(meta.decimals, extreme_decimals);
+    assert_eq!(meta.total_supply, huge_supply);
+    assert_eq!(meta.valuation, huge_valuation);
+
+    // Balance/supply bookkeeping stays internally consistent regardless of
+    // the (unrelated, unused-in-arithmetic) decimals value.
+    assert_eq!(token.balance(&admin), huge_supply);
+    assert_eq!(token.total_supply(), huge_supply);
+
+    // A subsequent mint still behaves normally: `decimals` plays no role in
+    // asset-token's own overflow checks, only in how a downstream consumer
+    // might choose to scale/interpret raw i128 amounts.
+    let bob = Address::generate(&env);
+    approve(&env, &compliance, &admin, &bob);
+    token.mint(&admin, &bob, &1_000);
+    assert_eq!(token.balance(&bob), 1_000);
+    assert_eq!(token.total_supply(), huge_supply + 1_000);
+}

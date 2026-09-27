@@ -225,6 +225,14 @@ impl AssetTokenContract {
     /// Batch-mint to multiple compliance-approved recipients in a single call.
     /// Admin only. Each `(recipient, amount)` pair is checked individually;
     /// if any recipient fails compliance the entire call reverts.
+    ///
+    /// Cost model: this function calls `Self::compliant` (a cross-contract call
+    /// into `compliance_contract`) once per entry in `recipients`, so both the
+    /// resource cost (CPU/memory instructions) and the number of cross-contract
+    /// calls scale linearly with `recipients.len()`. There is no batched or
+    /// single-call compliance check. Callers submitting large recipient lists
+    /// should budget the transaction's resource limits accordingly, and split
+    /// very large batches across multiple `mint_batch` calls if needed.
     pub fn mint_batch(env: Env, admin: Address, recipients: Vec<(Address, i128)>) {
         let mut meta = Self::require_admin(&env, &admin);
         if meta.paused {

@@ -79,6 +79,55 @@ fn test_register_before_init_panics_not_initialized() {
     );
 }
 
+// ---- regression test: no dedup on token_contract ----
+//
+// `register_asset` has no check that `token_contract` hasn't already been
+// registered under a different issuer/name (tracked as a design gap
+// separately). This locks in the current behavior — registering the same
+// token_contract twice creates two independent entries and double-counts
+// the valuation in `total_value_locked` — so a future dedup change shows up
+// here as an intentional test update, not a silent behavior shift.
+#[test]
+fn test_register_same_token_contract_twice_creates_two_entries_and_double_counts_tvl() {
+    let (env, client, _admin) = setup();
+    let issuer_a = Address::generate(&env);
+    let issuer_b = Address::generate(&env);
+    let token_contract = Address::generate(&env);
+
+    let id_a = client.register_asset(
+        &issuer_a,
+        &token_contract,
+        &String::from_str(&env, "Asset A"),
+        &String::from_str(&env, "real_estate"),
+        &10_000,
+    );
+    let id_b = client.register_asset(
+        &issuer_b,
+        &token_contract,
+        &String::from_str(&env, "Asset B"),
+        &String::from_str(&env, "commodity"),
+        &25_000,
+    );
+
+    // Two distinct entries were created, even though `token_contract` is
+    // identical — no dedup check exists today.
+    assert_ne!(id_a, id_b);
+    assert_eq!(client.asset_count(), 2);
+
+    let entry_a = client.get_asset(&id_a);
+    let entry_b = client.get_asset(&id_b);
+    assert_eq!(entry_a.token_contract, token_contract);
+    assert_eq!(entry_b.token_contract, token_contract);
+    assert_eq!(entry_a.issuer, issuer_a);
+    assert_eq!(entry_b.issuer, issuer_b);
+    assert_ne!(entry_a.name, entry_b.name);
+
+    // TVL sums both entries' valuations even though they reference the same
+    // underlying token contract — i.e. the same real-world asset can be
+    // double-counted today.
+    assert_eq!(client.total_value_locked(), 35_000);
+}
+
 #[test]
 fn test_register_and_get_asset() {
     let (env, client, _admin) = setup();

@@ -91,15 +91,23 @@ pub trait TokenInterface {
 
 ## Storage / TTL
 
-Listing of the contract `DataKey` variants and their storage behaviour.
+Listing of the contract `DataKey` variants and their storage behaviour. This
+table is generated from the `DataKey` enum in `contracts/dividend/src/lib.rs`
+via `scripts/generate_storage_docs.py` and reflects the snapshot-based
+distribution model (issue #163): `Snapshot` and `Supply` freeze the
+entitlement basis at `create_distribution` time, and `AssetIds` indexes
+distributions per asset token (issue #166).
 
 | Key | Payload | Storage | TTL / Notes |
 |-----|---------|---------|-------------|
-| `Admin` | - | instance | - |
-| `Counter` | - | instance | - |
-| `Ids` | - | unknown | - |
-| `Dist` | u64 | persistent | extended via instance() |
-| `Claimed` | u64, Address | unknown | per-key TTL |
+| `Admin` | - | instance | set once in `initialize`; never removed |
+| `Counter` | - | instance | monotonically increasing distribution id |
+| `Ids` | - | unused | legacy variant kept in the enum for ABI/storage-key stability; not read or written by any function |
+| `Dist(u64)` | distribution id | persistent | `extend_ttl` on create and on every `claim`/`complete` update |
+| `Claimed(u64, Address)` | distribution id, holder | persistent | set once per `(distribution, holder)` on `claim`; no explicit `extend_ttl` call |
+| `AssetIds(Address)` | asset token | persistent | `Vec<u64>` of distribution ids for that asset token; appended and TTL-extended on every `create_distribution` |
+| `Supply(u64)` | distribution id | persistent | snapshot total supply (the `claimable` denominator), frozen at creation; TTL-extended on create; removed once the distribution completes |
+| `Snapshot(u64)` | distribution id | persistent | the frozen `eligible: Vec<(Address, i128)>` entitlement list; TTL-extended on create; removed once the distribution completes |
 
 ## Security considerations
 
