@@ -103,6 +103,43 @@ fn test_expired_kyc_not_allowed() {
     assert!(!client.is_allowed(&user));
 }
 
+// Issue #341: pin the exact boundary at which a KYC approval lapses.
+// Semantics: `expires_at` is exclusive — the record is valid through
+// ledger `expires_at - 1`, and is expired starting at ledger `expires_at`
+// itself (not one ledger after it).
+#[test]
+fn test_expiry_boundary_one_before_is_allowed() {
+    let (env, client, admin) = setup();
+    let user = Address::generate(&env);
+    let us = String::from_str(&env, "US");
+    env.ledger().with_mut(|l| l.sequence_number = 10);
+    client.add_to_allowlist(&admin, &user, &us, &100);
+    env.ledger().with_mut(|l| l.sequence_number = 99);
+    assert!(client.is_allowed(&user));
+}
+
+#[test]
+fn test_expiry_boundary_exactly_at_expiry_is_expired() {
+    let (env, client, admin) = setup();
+    let user = Address::generate(&env);
+    let us = String::from_str(&env, "US");
+    env.ledger().with_mut(|l| l.sequence_number = 10);
+    client.add_to_allowlist(&admin, &user, &us, &100);
+    env.ledger().with_mut(|l| l.sequence_number = 100);
+    assert!(!client.is_allowed(&user));
+}
+
+#[test]
+fn test_expiry_boundary_one_after_is_expired() {
+    let (env, client, admin) = setup();
+    let user = Address::generate(&env);
+    let us = String::from_str(&env, "US");
+    env.ledger().with_mut(|l| l.sequence_number = 10);
+    client.add_to_allowlist(&admin, &user, &us, &100);
+    env.ledger().with_mut(|l| l.sequence_number = 101);
+    assert!(!client.is_allowed(&user));
+}
+
 #[test]
 fn test_block_jurisdiction_denies_approved() {
     let (env, client, admin) = setup();
@@ -369,8 +406,11 @@ fn test_prune_expired_removes_from_allowlist() {
     assert!(!client.is_allowed(&user_expire));
     assert!(client.is_allowed(&user_persist));
 
-    // Prune expired records
-    client.prune_expired(&admin);
+    // Prune expired records. max_records = 0 means unbounded, matching the
+    // pre-#333 behaviour for a small allowlist: a single call finishes the
+    // whole pass and reports 0 remaining.
+    let remaining = client.prune_expired(&admin, &0);
+    assert_eq!(remaining, 0);
 
     // Verify get_allowlist no longer contains the expired user
     let list = client.get_allowlist();
@@ -380,4 +420,112 @@ fn test_prune_expired_removes_from_allowlist() {
     // Verify get_record returns None for the pruned user
     assert!(client.get_record(&user_expire).is_none());
     assert!(client.get_record(&user_persist).is_some());
+}
+
+#[test]
+fn test_add_to_allowlist_batch_admits_several_addresses() {
+    // Issue #338: several addresses can be admitted in one transaction, with
+    // the same validation/normalization as the single-address path.
+    let (env, client, admin) = setup();
+    let user_a = Address::generate(&env);
+    let user_b = Address::generate(&env);
+    let us = String::from_str(&env, "us"); // lowercase, mirrors normalize path
+    let ke = String::from_str(&env, "KE");
+    let mut entries: Vec<AllowlistEntry> = Vec::new(&env);
+    entries.push_back(AllowlistEntry {
+        address: user_a.clone(),
+        jurisdiction: us.clone(),
+        expires_at: 0,
+    });
+    entries.push_back(AllowlistEntry {
+        address: user_b.clone(),
+        jurisdiction: ke.clone(),
+        expires_at: 0,
+    });
+
+    client.add_to_allowlist_batch(&admin, &entries);
+
+    assert!(client.is_allowed(&user_a));
+    assert!(client.is_allowed(&user_b));
+    assert_eq!(
+        client.get_record(&user_a).unwrap().jurisdiction,
+        String::from_str(&env, "US")
+    );
+    assert_eq!(client.get_allowlist().len(), 2);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #4)")]
+fn test_add_to_allowlist_batch_partial_failure_reverts_whole_batch() {
+    // Issue #338: a failure in one entry must not silently skip that entry
+    // while committing the others — the whole call reverts.
+    let (env, client, admin) = setup();
+    let user_a = Address::generate(&env);
+    let user_bad = Address::generate(&env);
+    let us = String::from_str(&env, "US");
+    env.ledger().with_mut(|l| l.sequence_number = 500);
+    let mut entries: Vec<AllowlistEntry> = Vec::new(&env);
+    entries.push_back(AllowlistEntry {
+        address: user_a.clone(),
+        jurisdiction: us.clone(),
+        expires_at: 0,
+    });
+    // Second entry has an expiry already in the past: identical to what
+    // add_to_allowlist rejects with Error::InvalidExpiry (#4).
+    entries.push_back(AllowlistEntry {
+        address: user_bad.clone(),
+        jurisdiction: us.clone(),
+        expires_at: 100,
+    });
+
+    client.add_to_allowlist_batch(&admin, &entries);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #5)")]
+fn test_add_to_allowlist_batch_non_admin_rejected() {
+    let (env, client, _admin) = setup();
+    let impostor = Address::generate(&env);
+    let user = Address::generate(&env);
+    let us = String::from_str(&env, "US");
+    let mut entries: Vec<AllowlistEntry> = Vec::new(&env);
+    entries.push_back(AllowlistEntry {
+        address: user,
+        jurisdiction: us,
+        expires_at: 0,
+    });
+    client.add_to_allowlist_batch(&impostor, &entries);
+}
+
+#[test]
+fn test_prune_expired_respects_bound_and_reports_remaining() {
+    // Issue #333: prune_expired must accept a bound on how many records a
+    // single call processes, and report how many are left to examine.
+    let (env, client, admin) = setup();
+    let us = String::from_str(&env, "US");
+    let mut users: Vec<Address> = Vec::new(&env);
+    for _ in 0..5 {
+        users.push_back(Address::generate(&env));
+    }
+    env.ledger().with_mut(|l| l.sequence_number = 10);
+    for u in users.iter() {
+        client.add_to_allowlist(&admin, &u, &us, &100);
+    }
+    env.ledger().with_mut(|l| l.sequence_number = 101);
+    assert_eq!(client.get_allowlist().len(), 5);
+
+    // First call only examines 2 of the 5 expired entries.
+    let remaining = client.prune_expired(&admin, &2);
+    assert_eq!(remaining, 3);
+    assert_eq!(client.get_allowlist().len(), 3);
+
+    // Second call examines the rest.
+    let remaining = client.prune_expired(&admin, &2);
+    assert_eq!(remaining, 1);
+    assert_eq!(client.get_allowlist().len(), 1);
+
+    // Final call clears the last one; nothing left to examine.
+    let remaining = client.prune_expired(&admin, &2);
+    assert_eq!(remaining, 0);
+    assert_eq!(client.get_allowlist().len(), 0);
 }
