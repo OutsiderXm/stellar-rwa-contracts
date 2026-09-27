@@ -451,6 +451,21 @@ fn test_burn_blocked_when_holder_not_compliant() {
     s.token.burn(&bob, &100);
 }
 
+/// Pins the deliberate policy documented on `AssetTokenContract::burn`: a
+/// holder who is *suspended* (as opposed to fully removed) is still
+/// compliance-gated and may not burn their tokens.
+#[test]
+#[should_panic(expected = "Error(Contract, #7)")]
+fn test_burn_blocked_when_holder_suspended() {
+    let s = setup(1_000);
+    let bob = Address::generate(&s.env);
+    approve(&s.env, &s.compliance, &s.admin, &bob);
+    s.token.transfer(&s.admin, &bob, &200);
+    // Bob holds tokens; suspend (not remove) his approval.
+    s.compliance.suspend(&s.admin, &bob);
+    s.token.burn(&bob, &100);
+}
+
 #[test]
 #[should_panic(expected = "Error(Contract, #8)")]
 fn test_initialize_reverts_when_admin_not_compliant() {
