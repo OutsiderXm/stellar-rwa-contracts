@@ -8,7 +8,20 @@
 //! addresses can ever hold the asset.
 //!
 //! Valuation is stored in USD cents (`i128`). Amounts are integer token units in
-//! the token's own `decimals` base.
+//! the token's own `decimals` base. A zero-decimal token therefore cannot
+//! represent fractional token units; downstream proportional calculations can
+//! floor small claims to zero.
+//!
+//! ## Admin is independent of the compliance admin (issue #3)
+//!
+//! The `admin` stored in [`AssetMetadata`] (mint/pause/valuation/etc.) and the
+//! admin of the linked `compliance_contract` are tracked in entirely separate
+//! storage and are never compared to each other. Only `compliance_contract`'s
+//! `is_allowed` result is consulted here; its admin's identity is opaque to
+//! this contract. A real issuer can therefore have compliance administered by
+//! a dedicated compliance officer while a different address runs the asset
+//! token. `scripts/deploy.sh` uses one address for both only as a convenience
+//! default for its sample single-operator deployment.
 
 #[cfg(test)]
 extern crate std;
@@ -41,6 +54,14 @@ pub struct AssetMetadata {
     /// Asset value in USD cents.
     pub valuation: i128,
     pub paused: bool,
+    /// Optional emergency-pause delegate (issue #1). May call `pause` but
+    /// not `unpause`, `mint`, `mint_batch`, or any other admin action.
+    /// Absent (`None`) by default.
+    pub guardian: Option<Address>,
+    /// Address nominated by the current admin via `propose_admin`, pending
+    /// acceptance via `accept_admin` (issue #4). Absent when there is no
+    /// proposal in flight.
+    pub pending_admin: Option<Address>,
 }
 
 #[contracttype]
@@ -76,6 +97,9 @@ pub enum Error {
     InvalidCompliance = 11,
     InsufficientAllowance = 12,
     ValuationChangeTooLarge = 13,
+    /// `accept_admin` or `cancel_admin_proposal` called with no pending
+    /// admin proposal on file (issue #4).
+    NoPendingAdmin = 12,
 }
 
 /// Maximum byte lengths for string metadata fields (issue #46).
@@ -155,6 +179,8 @@ impl AssetTokenContract {
             asset_description,
             valuation,
             paused: false,
+            guardian: None,
+            pending_admin: None,
         };
         env.storage().instance().set(&DataKey::Metadata, &metadata);
         Self::set_balance(&env, &admin, total_supply);
@@ -172,6 +198,27 @@ impl AssetTokenContract {
 
     /// Transfer `amount` from `from` to `to`. Both parties must be
     /// compliance-approved and the token must not be paused.
+    ///
+    /// ## Deliberate policy: zero-amount transfers
+    /// A `transfer` of `0` is rejected with [`Error::InvalidAmount`] via
+    /// [`Self::check_amount`], rather than silently succeeding as a no-op.
+    /// A zero-amount call that emits a `transfer` event with no balance
+    /// change is misleading to indexers/observers and still costs the
+    /// caller fees for nothing; requiring a strictly positive amount makes
+    /// that intent explicit and forces callers to skip the call entirely
+    /// instead of relying on the contract to swallow it.
+    ///
+    /// ## Deliberate policy: self-transfers (`from == to`)
+    /// A transfer where `from == to` is **allowed** (it is not rejected)
+    /// but is short-circuited into a pure no-op: balances are not touched,
+    /// but a `transfer` event is still emitted with `new_from_bal ==
+    /// new_to_bal == from_bal` so downstream indexers see a consistent
+    /// event shape. Rejecting self-transfers outright would be an
+    /// additional special case for callers (e.g. a UI that lets a user
+    /// pick any two addresses) to defend against; treating it as an
+    /// explicit no-op is simpler and cannot corrupt balances, since the
+    /// naive "debit then credit" sequence for `from == to` would otherwise
+    /// double-apply the write and inflate the balance.
     pub fn transfer(env: Env, from: Address, to: Address, amount: i128) {
         from.require_auth();
         Self::check_amount(&env, amount);
@@ -220,6 +267,19 @@ impl AssetTokenContract {
     }
 
     /// Mint new tokens to a compliance-approved recipient. Admin only.
+    ///
+    /// ## Deliberate policy: mint gates the recipient
+    /// Unlike `transfer`, `mint` has no "sender" to gate — but the
+    /// recipient (`to`) is checked against the compliance contract exactly
+    /// like the `to` side of a `transfer`, via
+    /// `Self::compliant(&env, &meta.compliance_contract, &to)`, and reverts
+    /// with [`Error::RecipientNotCompliant`] if it fails. This is
+    /// deliberate: minting is the only way new supply enters circulation,
+    /// so if it were not gated an admin (or automation acting on the
+    /// admin's behalf) could hand tokens to an unverified address that no
+    /// `transfer` could ever have reached. `mint_batch` applies the same
+    /// per-recipient check to every entry in the batch. See
+    /// `docs/asset-token.md` for the documented decision.
     pub fn mint(env: Env, admin: Address, to: Address, amount: i128) {
         let mut meta = Self::require_admin(&env, &admin);
         Self::check_amount(&env, amount);
@@ -247,6 +307,14 @@ impl AssetTokenContract {
     /// Batch-mint to multiple compliance-approved recipients in a single call.
     /// Admin only. Each `(recipient, amount)` pair is checked individually;
     /// if any recipient fails compliance the entire call reverts.
+    ///
+    /// Cost model: this function calls `Self::compliant` (a cross-contract call
+    /// into `compliance_contract`) once per entry in `recipients`, so both the
+    /// resource cost (CPU/memory instructions) and the number of cross-contract
+    /// calls scale linearly with `recipients.len()`. There is no batched or
+    /// single-call compliance check. Callers submitting large recipient lists
+    /// should budget the transaction's resource limits accordingly, and split
+    /// very large batches across multiple `mint_batch` calls if needed.
     pub fn mint_batch(env: Env, admin: Address, recipients: Vec<(Address, i128)>) {
         let mut meta = Self::require_admin(&env, &admin);
         if meta.paused {
@@ -274,6 +342,20 @@ impl AssetTokenContract {
     }
 
     /// Burn `amount` of the caller's own tokens.
+    ///
+    /// ## Deliberate policy: a suspended holder may not burn
+    /// `burn` checks the caller against the compliance contract
+    /// (`Self::compliant(&env, &meta.compliance_contract, &from)`) exactly
+    /// like the `from` side of a `transfer`, and reverts with
+    /// [`Error::SenderNotCompliant`] if the caller is not currently
+    /// approved (whether suspended or removed outright). Burning still
+    /// moves balance and total-supply state, so it is treated as a
+    /// balance-changing operation subject to the same compliance gate as
+    /// every other one, rather than as an exception a suspended holder
+    /// could use to self-service an exit. A holder who needs to redeem or
+    /// exit while suspended must first be reinstated (or have the admin
+    /// act on their behalf via a separate, explicit path) — burn itself
+    /// does not special-case suspension.
     pub fn burn(env: Env, from: Address, amount: i128) {
         from.require_auth();
         Self::check_amount(&env, amount);
@@ -422,19 +504,41 @@ impl AssetTokenContract {
     /// continue.
     pub fn pause(env: Env, admin: Address) {
         let mut meta = Self::require_admin(&env, &admin);
+    /// Pause all transfers and mints. Callable by the admin, or by the
+    /// optional guardian (issue #1) if one has been set via
+    /// `set_guardian`. The guardian cannot unpause, mint, or perform any
+    /// other admin action.
+    pub fn pause(env: Env, caller: Address) {
+        caller.require_auth();
+        let mut meta = Self::metadata(&env);
+        let is_guardian = meta.guardian.as_ref() == Some(&caller);
+        if meta.admin != caller && !is_guardian {
+            panic_err(&env, Error::Unauthorized);
+        }
         meta.paused = true;
         env.storage().instance().set(&DataKey::Metadata, &meta);
         Self::bump(&env);
-        env.events().publish((symbol_short!("pause"),), admin);
+        env.events().publish((symbol_short!("pause"),), caller);
     }
 
-    /// Resume transfers and mints. Admin only.
+    /// Resume transfers and mints. Admin only; the guardian cannot unpause.
     pub fn unpause(env: Env, admin: Address) {
         let mut meta = Self::require_admin(&env, &admin);
         meta.paused = false;
         env.storage().instance().set(&DataKey::Metadata, &meta);
         Self::bump(&env);
         env.events().publish((symbol_short!("unpause"),), admin);
+    }
+
+    /// Set or clear the optional guardian address. Admin only. Pass `None`
+    /// to remove the guardian and restrict `pause` back to the admin alone.
+    pub fn set_guardian(env: Env, admin: Address, guardian: Option<Address>) {
+        let mut meta = Self::require_admin(&env, &admin);
+        meta.guardian = guardian;
+        env.storage().instance().set(&DataKey::Metadata, &meta);
+        Self::bump(&env);
+        env.events()
+            .publish((symbol_short!("guardian"),), meta.guardian);
     }
 
     /// Full asset metadata.
@@ -448,6 +552,11 @@ impl AssetTokenContract {
     /// `MAX_VALUATION_CHANGE_BPS` of its previous value (see the constant's
     /// doc comment for the reasoning). Larger re-appraisals must be phased
     /// in across multiple `update_valuation` calls.
+    /// This updates only the token metadata. If this token is also registered
+    /// in the registry, the registry's valuation is an independent snapshot
+    /// from registration and is not updated by this call. Clients and
+    /// operators must use a separate registry update workflow when they need
+    /// the records to agree; the current registry API has no update hook.
     pub fn update_valuation(env: Env, admin: Address, new_valuation: i128) {
         let mut meta = Self::require_admin(&env, &admin);
         if new_valuation < 0 {
@@ -498,6 +607,66 @@ impl AssetTokenContract {
             (symbol_short!("setcomp"),),
             (old_compliance, compliance),
         );
+    }
+
+    /// Propose a new admin. Requires authorization from the current admin.
+    /// The role does not move yet — `new_admin` must call `accept_admin`
+    /// before the handover takes effect (issue #4). This makes a mistyped
+    /// `new_admin` harmless (it can simply be re-proposed or cancelled)
+    /// instead of a single-step transfer that would permanently brick
+    /// administration. Note this does not affect the optional guardian
+    /// (issue #1), which is set independently via `set_guardian`.
+    pub fn propose_admin(env: Env, admin: Address, new_admin: Address) {
+        let mut meta = Self::require_admin(&env, &admin);
+        meta.pending_admin = Some(new_admin.clone());
+        env.storage().instance().set(&DataKey::Metadata, &meta);
+        Self::bump(&env);
+        env.events()
+            .publish((symbol_short!("proposed"), admin), new_admin);
+    }
+
+    /// Cancel a pending admin proposal. Requires authorization from the
+    /// current admin. Panics with `NoPendingAdmin` if there is nothing to
+    /// cancel.
+    pub fn cancel_admin_proposal(env: Env, admin: Address) {
+        let mut meta = Self::require_admin(&env, &admin);
+        if meta.pending_admin.is_none() {
+            panic_err(&env, Error::NoPendingAdmin);
+        }
+        meta.pending_admin = None;
+        env.storage().instance().set(&DataKey::Metadata, &meta);
+        Self::bump(&env);
+        env.events()
+            .publish((symbol_short!("cancelled"), admin), ());
+    }
+
+    /// Accept a pending admin proposal, completing the handover. Must be
+    /// called by the proposed successor (issue #4); the role only ever moves
+    /// here, never in `propose_admin`. Emits `set_admin` carrying both the
+    /// previous and new admin so off-chain indexers can observe this
+    /// security-critical transition (issue #2).
+    pub fn accept_admin(env: Env, new_admin: Address) {
+        new_admin.require_auth();
+        let mut meta = Self::metadata(&env);
+        let pending = meta
+            .pending_admin
+            .clone()
+            .unwrap_or_else(|| panic_err(&env, Error::NoPendingAdmin));
+        if pending != new_admin {
+            panic_err(&env, Error::Unauthorized);
+        }
+        let old_admin = meta.admin.clone();
+        meta.admin = new_admin.clone();
+        meta.pending_admin = None;
+        env.storage().instance().set(&DataKey::Metadata, &meta);
+        Self::bump(&env);
+        env.events()
+            .publish((symbol_short!("set_admin"), old_admin), new_admin);
+    }
+
+    /// The address currently proposed as the next admin, if any.
+    pub fn get_pending_admin(env: Env) -> Option<Address> {
+        Self::metadata(&env).pending_admin
     }
 
     // ---- internal helpers ----

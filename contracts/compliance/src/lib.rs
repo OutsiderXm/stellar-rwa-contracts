@@ -8,6 +8,16 @@
 //!
 //! Time is expressed in ledger sequence numbers (`u32`), not wall-clock dates.
 //! An `expires_at` of `0` means the KYC approval never expires.
+//!
+//! ## Admin is independent of the asset-token admin (issue #3)
+//!
+//! This contract's admin (set via [`ComplianceContract::initialize`]) is its
+//! own, self-contained piece of state — nothing here reads or depends on the
+//! `admin` stored by any asset-token contract that points at it. An issuer is
+//! free to run compliance under a dedicated compliance officer's address
+//! while a different address administers the asset token; `scripts/deploy.sh`
+//! passes the same address for both purely as a convenience default for a
+//! single-operator demo deployment, not because the contracts require it.
 
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, symbol_short, Address, Env, String, Vec,
@@ -23,17 +33,34 @@ pub enum ComplianceStatus {
     Suspended,
 }
 
+/// One entry of an [`ComplianceContract::add_to_allowlist_batch`] call. Mirrors
+/// the parameters of [`ComplianceContract::add_to_allowlist`] exactly, so each
+/// entry is validated the same way it would be if submitted individually.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AllowlistEntry {
+    pub address: Address,
+    pub jurisdiction: String,
+    pub expires_at: u32,
+}
+
 /// A single KYC record for an address.
 #[contracttype]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct KycRecord {
     pub address: Address,
     pub status: ComplianceStatus,
-    /// ISO country code, e.g. "US", "KE", "DE".
+    /// Canonical ISO-3166-1 alpha-2 country code, e.g. "US", "KE", "DE".
+    /// Always exactly 2 uppercase ASCII letters; see [`normalize_jurisdiction`]
+    /// for the enforced canonical form.
     pub jurisdiction: String,
     /// Ledger sequence at which the record was verified.
     pub verified_at: u32,
-    /// Ledger sequence at which approval expires; `0` = never expires.
+    /// Ledger sequence at which approval expires.
+    ///
+    /// Sentinel: `0` means the approval **never expires**. See the
+    /// module-level "The `expires_at = 0` sentinel" section for why this is
+    /// safe and how [`ComplianceContract::is_allowed`] treats it.
     pub expires_at: u32,
 }
 
@@ -42,6 +69,10 @@ pub struct KycRecord {
 #[derive(Clone)]
 enum DataKey {
     Admin,
+    /// Address nominated by the current admin via `propose_admin`, pending
+    /// acceptance via `accept_admin` (issue #4). Absent when there is no
+    /// proposal in flight.
+    PendingAdmin,
     /// Small fixed-size (current_page, current_page_len) cursor for appends.
     AllowlistMeta,
     /// One page of up to `ALLOWLIST_PAGE_SIZE` addresses, in persistent storage
@@ -50,13 +81,28 @@ enum DataKey {
     AllowlistPage(u32),
     /// Which page an address currently lives on, for O(1) removal.
     AllowlistPageOf(Address),
+    /// Maintained counter of addresses currently on the allowlist, kept in
+    /// sync by `append_to_allowlist` / `remove_from_allowlist` so
+    /// `get_allowlist_count` never has to walk any pages.
+    AllowlistCount,
     Record(Address),
     Blocked(String),
+    /// Ordered list of every jurisdiction currently blocked, kept in sync
+    /// with the individual `Blocked(String)` flags so the full blocked set
+    /// can be read directly instead of being inferred off-chain from the
+    /// absence of approved addresses in a jurisdiction.
+    BlockedList,
 }
 
 /// Max addresses per allowlist page (issue #177). Bounds the size of any single
 /// storage entry regardless of how large the KYC list grows.
 const ALLOWLIST_PAGE_SIZE: u32 = 200;
+
+/// Maximum number of addresses `get_allowlist_page` will return in a single
+/// call, regardless of the requested `limit`. Callers that pass `0` or a
+/// value greater than this get back exactly this many entries (or fewer, on
+/// the final partial page).
+pub const MAX_ALLOWLIST_PAGE_SIZE: u32 = 200;
 
 /// Typed contract errors. Signalled via `panic_with_error!`, which produces a
 /// deterministic contract error (not an unhandled host panic).
@@ -70,6 +116,9 @@ pub enum Error {
     InvalidExpiry = 4,
     Unauthorized = 5,
     InvalidJurisdiction = 6,
+    /// `accept_admin` or `cancel_admin_proposal` called with no pending
+    /// admin proposal on file (issue #4).
+    NoPendingAdmin = 7,
 }
 
 const DAY_IN_LEDGERS: u32 = 17_280; // ~5s ledgers
@@ -165,6 +214,74 @@ impl ComplianceContract {
         );
     }
 
+    /// Add (or re-approve) several addresses on the KYC allowlist in one
+    /// transaction (issue #338). Each [`AllowlistEntry`] carries its own
+    /// `jurisdiction` and `expires_at`, so every entry is validated and
+    /// normalized exactly as [`Self::add_to_allowlist`] validates a single
+    /// address: same expiry check, same jurisdiction normalization, same
+    /// audit-trail capture, same per-address `approved` event.
+    ///
+    /// If any entry fails validation (e.g. its `expires_at` is in the past,
+    /// or its jurisdiction is malformed), the call panics immediately with
+    /// the same error the single-address path would raise for that entry.
+    /// Soroban rolls back all state changes made earlier in the same
+    /// invocation when it panics, so a failing entry never silently skips
+    /// itself while leaving earlier entries in the batch committed — the
+    /// whole batch either fully applies or fully reverts.
+    pub fn add_to_allowlist_batch(env: Env, admin: Address, entries: Vec<AllowlistEntry>) {
+        Self::require_admin(&env, &admin);
+        let now = env.ledger().sequence();
+
+        for entry in entries.iter() {
+            let address = entry.address;
+            let expires_at = entry.expires_at;
+            if expires_at != 0 && expires_at <= now {
+                panic_with_error(&env, Error::InvalidExpiry);
+            }
+            let jurisdiction = normalize_jurisdiction(&env, &entry.jurisdiction);
+
+            let prev: Option<KycRecord> = env
+                .storage()
+                .persistent()
+                .get(&DataKey::Record(address.clone()));
+
+            let record = KycRecord {
+                address: address.clone(),
+                status: ComplianceStatus::Approved,
+                jurisdiction: jurisdiction.clone(),
+                verified_at: now,
+                expires_at,
+            };
+            env.storage()
+                .persistent()
+                .set(&DataKey::Record(address.clone()), &record);
+
+            if prev.is_none() {
+                Self::append_to_allowlist(&env, &address);
+            }
+
+            let (prev_jurisdiction, prev_expires_at, was_suspended) = match prev {
+                Some(ref r) => (
+                    r.jurisdiction.clone(),
+                    r.expires_at,
+                    r.status == ComplianceStatus::Suspended,
+                ),
+                None => (jurisdiction.clone(), 0u32, false),
+            };
+            env.events().publish(
+                (symbol_short!("approved"), address),
+                (
+                    jurisdiction,
+                    expires_at,
+                    prev_jurisdiction,
+                    prev_expires_at,
+                    was_suspended,
+                ),
+            );
+        }
+        Self::bump_instance(&env);
+    }
+
     /// Suspend an approved address. Its record is retained but `is_allowed`
     /// returns `false` until it is re-approved.
     pub fn suspend(env: Env, admin: Address, address: Address) {
@@ -177,6 +294,27 @@ impl ComplianceContract {
         Self::bump_instance(&env);
         env.events()
             .publish((symbol_short!("suspend"), address), ());
+    }
+
+    /// Reinstate a `Suspended` address without discarding its original KYC
+    /// metadata. Unlike calling `add_to_allowlist` again (which requires the
+    /// caller to resupply `jurisdiction`/`expires_at` and overwrites
+    /// `verified_at`), `reinstate` flips the status back to `Approved` and
+    /// leaves `jurisdiction`, `verified_at` and `expires_at` untouched.
+    /// Admin only. Errors: `RecordNotFound (#3)`, `NotSuspended (#7)`.
+    pub fn reinstate(env: Env, admin: Address, address: Address) {
+        Self::require_admin(&env, &admin);
+        let mut record = Self::load_record(&env, &address);
+        if record.status != ComplianceStatus::Suspended {
+            panic_with_error(&env, Error::NotSuspended);
+        }
+        record.status = ComplianceStatus::Approved;
+        env.storage()
+            .persistent()
+            .set(&DataKey::Record(address.clone()), &record);
+        Self::bump_instance(&env);
+        env.events()
+            .publish((symbol_short!("reinstat"), address), ());
     }
 
     /// Remove an address entirely from the allowlist.
@@ -214,6 +352,11 @@ impl ComplianceContract {
             return false;
         }
         let now = env.ledger().sequence();
+        // Boundary semantics (issue #341): `expires_at` is exclusive. A record
+        // is still valid at `expires_at - 1`, and lapses starting exactly at
+        // ledger `expires_at` (i.e. `now >= expires_at` is expired, not
+        // `now > expires_at`). This matches `add_to_allowlist`, which already
+        // rejects `expires_at <= now` as already-expired at creation time.
         if record.expires_at != 0 && now >= record.expires_at {
             // Emit an expiry event so indexers can track the transition (issue #21).
             env.events()
@@ -273,14 +416,85 @@ impl ComplianceContract {
         all
     }
 
+    /// Number of addresses currently on the allowlist, in O(1) — backed by a
+    /// maintained counter rather than walking `get_allowlist`'s pages.
+    ///
+    /// The counter is incremented exactly when a brand-new address is
+    /// appended to a page (`append_to_allowlist`, called from
+    /// `add_to_allowlist` the first time an address is seen) and decremented
+    /// exactly when an address is removed from its page
+    /// (`remove_from_allowlist`, called from `remove`). `suspend` only flips
+    /// `KycRecord::status` — the address's page membership (and thus this
+    /// counter) is untouched, which matches `get_allowlist`'s existing
+    /// behaviour of listing suspended addresses too.
+    pub fn get_allowlist_count(env: Env) -> u32 {
+        env.storage()
+            .instance()
+            .get(&DataKey::AllowlistCount)
+            .unwrap_or(0u32)
+    }
+
+    /// Page through the allowlist without transferring the whole list.
+    ///
+    /// `offset` is the number of addresses to skip from the start of the
+    /// allowlist; `limit` is the maximum number of addresses to return.
+    /// `limit` is clamped to [`MAX_ALLOWLIST_PAGE_SIZE`] — passing `0` or a
+    /// value above the maximum returns up to the maximum page size. Passing
+    /// an `offset` at or beyond the end of the list returns an empty `Vec`,
+    /// which is how callers detect the final page.
+    pub fn get_allowlist_page(env: Env, offset: u32, limit: u32) -> Vec<Address> {
+        let limit = if limit == 0 || limit > MAX_ALLOWLIST_PAGE_SIZE {
+            MAX_ALLOWLIST_PAGE_SIZE
+        } else {
+            limit
+        };
+        let mut result = Vec::new(&env);
+        let mut skipped: u32 = 0;
+        let (current_page, _) = Self::allowlist_meta(&env);
+        for page_idx in 0..=current_page {
+            if result.len() as u32 >= limit {
+                break;
+            }
+            let page: Option<Vec<Address>> = env
+                .storage()
+                .persistent()
+                .get(&DataKey::AllowlistPage(page_idx));
+            let page = match page {
+                Some(p) if !p.is_empty() => p,
+                _ => continue,
+            };
+            for a in page.iter() {
+                if skipped < offset {
+                    skipped += 1;
+                    continue;
+                }
+                if result.len() as u32 >= limit {
+                    break;
+                }
+                result.push_back(a);
+            }
+        }
+        result
+    }
+
     /// Block an entire jurisdiction (country code). Approved addresses in a
     /// blocked jurisdiction fail `is_allowed`.
     pub fn block_jurisdiction(env: Env, admin: Address, jurisdiction: String) {
         Self::require_admin(&env, &admin);
         let jurisdiction = normalize_jurisdiction(&env, &jurisdiction);
+        let already_blocked: bool = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Blocked(jurisdiction.clone()))
+            .unwrap_or(false);
         env.storage()
             .persistent()
             .set(&DataKey::Blocked(jurisdiction.clone()), &true);
+        if !already_blocked {
+            let mut list = Self::blocked_list(&env);
+            list.push_back(jurisdiction.clone());
+            env.storage().instance().set(&DataKey::BlockedList, &list);
+        }
         Self::bump_instance(&env);
         env.events()
             .publish((symbol_short!("blockjur"),), jurisdiction);
@@ -293,6 +507,14 @@ impl ComplianceContract {
         env.storage()
             .persistent()
             .remove(&DataKey::Blocked(jurisdiction.clone()));
+        let list = Self::blocked_list(&env);
+        let mut next = Vec::new(&env);
+        for j in list.iter() {
+            if j != jurisdiction {
+                next.push_back(j);
+            }
+        }
+        env.storage().instance().set(&DataKey::BlockedList, &next);
         Self::bump_instance(&env);
         env.events()
             .publish((symbol_short!("unblkjur"),), jurisdiction);
@@ -307,17 +529,29 @@ impl ComplianceContract {
             .unwrap_or(false)
     }
 
-    /// Prune all expired records from the allowlist. Admin only (issue #21).
+    /// Prune expired records from the allowlist. Admin only (issue #21).
     /// Removes expired entries from persistent storage and the allowlist vector
     /// so indexers and `get_allowlist` no longer count them as Approved.
     ///
     /// Issue #306: previously iterated every allocated page unconditionally.
     /// We now skip absent or already-empty pages so cost scales with live
     /// pages, not historical page count.
-    pub fn prune_expired(env: Env, admin: Address) {
+    ///
+    /// Issue #333: a single invocation can still exceed host resource limits
+    /// once the allowlist is large enough, since the whole thing was scanned
+    /// in one call regardless of size. `max_records` bounds how many
+    /// individual allowlist entries this call will inspect before returning,
+    /// so a large allowlist can be pruned incrementally across several
+    /// transactions. Passing `0` means "no bound" (scan everything), which
+    /// preserves prior behaviour for small allowlists. The return value is
+    /// the number of entries left unexamined (i.e. still possibly expired
+    /// and not yet checked) once the bound is hit, so callers know whether
+    /// to invoke again; it is `0` once a full pass completes.
+    pub fn prune_expired(env: Env, admin: Address, max_records: u32) -> u32 {
         Self::require_admin(&env, &admin);
         let now = env.ledger().sequence();
         let (current_page, _) = Self::allowlist_meta(&env);
+        let mut examined: u32 = 0;
         for page_idx in 0..=current_page {
             let page: Option<Vec<Address>> = env
                 .storage()
@@ -329,7 +563,18 @@ impl ComplianceContract {
             };
             let mut next = Vec::new(&env);
             let mut changed = false;
+            let mut stopped_early = false;
+            let mut unexamined_in_page: u32 = 0;
             for addr in page.iter() {
+                if max_records != 0 && examined >= max_records {
+                    // Bound reached: keep this and every remaining entry in
+                    // the page untouched, to be examined on a later call.
+                    next.push_back(addr);
+                    stopped_early = true;
+                    unexamined_in_page += 1;
+                    continue;
+                }
+                examined += 1;
                 let record: Option<KycRecord> = env
                     .storage()
                     .persistent()
@@ -363,8 +608,25 @@ impl ComplianceContract {
                     .persistent()
                     .set(&DataKey::AllowlistPage(page_idx), &next);
             }
+            if stopped_early {
+                // Entries left unexamined in this page, plus every entry on
+                // pages not yet visited at all.
+                let mut total_remaining = unexamined_in_page;
+                for later_idx in (page_idx + 1)..=current_page {
+                    let later: Option<Vec<Address>> = env
+                        .storage()
+                        .persistent()
+                        .get(&DataKey::AllowlistPage(later_idx));
+                    if let Some(p) = later {
+                        total_remaining += p.len();
+                    }
+                }
+                Self::bump_instance(&env);
+                return total_remaining;
+            }
         }
         Self::bump_instance(&env);
+        0
     }
 
     /// Return the configured admin address.
@@ -373,6 +635,68 @@ impl ComplianceContract {
             .instance()
             .get(&DataKey::Admin)
             .unwrap_or_else(|| panic_with_error(&env, Error::NotInitialized))
+    }
+
+    /// Propose a new admin. Requires authorization from the current admin.
+    /// The role does not move yet — `new_admin` must call `accept_admin`
+    /// before the handover takes effect (issue #4). This makes a mistyped
+    /// `new_admin` harmless (it can simply be re-proposed or cancelled)
+    /// instead of a single-step transfer that would permanently brick
+    /// administration.
+    pub fn propose_admin(env: Env, admin: Address, new_admin: Address) {
+        Self::require_admin(&env, &admin);
+        env.storage()
+            .instance()
+            .set(&DataKey::PendingAdmin, &new_admin);
+        Self::bump_instance(&env);
+        env.events()
+            .publish((symbol_short!("proposed"), admin), new_admin);
+    }
+
+    /// Cancel a pending admin proposal. Requires authorization from the
+    /// current admin. Panics with `NoPendingAdmin` if there is nothing to
+    /// cancel.
+    pub fn cancel_admin_proposal(env: Env, admin: Address) {
+        Self::require_admin(&env, &admin);
+        if !env.storage().instance().has(&DataKey::PendingAdmin) {
+            panic_with_error(&env, Error::NoPendingAdmin);
+        }
+        env.storage().instance().remove(&DataKey::PendingAdmin);
+        Self::bump_instance(&env);
+        env.events()
+            .publish((symbol_short!("cancelled"), admin), ());
+    }
+
+    /// Accept a pending admin proposal, completing the handover. Must be
+    /// called by the proposed successor (issue #4); the role only ever moves
+    /// here, never in `propose_admin`. Emits `set_admin` carrying both the
+    /// previous and new admin so off-chain indexers can observe this
+    /// security-critical transition (issue #2).
+    pub fn accept_admin(env: Env, new_admin: Address) {
+        new_admin.require_auth();
+        let pending: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::PendingAdmin)
+            .unwrap_or_else(|| panic_with_error(&env, Error::NoPendingAdmin));
+        if pending != new_admin {
+            panic_with_error(&env, Error::Unauthorized);
+        }
+        let old_admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .unwrap_or_else(|| panic_with_error(&env, Error::NotInitialized));
+        env.storage().instance().set(&DataKey::Admin, &new_admin);
+        env.storage().instance().remove(&DataKey::PendingAdmin);
+        Self::bump_instance(&env);
+        env.events()
+            .publish((symbol_short!("set_admin"), old_admin), new_admin);
+    }
+
+    /// The address currently proposed as the next admin, if any.
+    pub fn get_pending_admin(env: Env) -> Option<Address> {
+        env.storage().instance().get(&DataKey::PendingAdmin)
     }
 
     // ---- internal helpers ----
@@ -395,6 +719,14 @@ impl ComplianceContract {
             .persistent()
             .get(&DataKey::Record(address.clone()))
             .unwrap_or_else(|| panic_with_error(env, Error::RecordNotFound))
+    }
+
+    /// The current blocked-jurisdiction list, or empty if none are blocked.
+    fn blocked_list(env: &Env) -> Vec<String> {
+        env.storage()
+            .instance()
+            .get(&DataKey::BlockedList)
+            .unwrap_or_else(|| Vec::new(env))
     }
 
     fn bump_instance(env: &Env) {
@@ -436,6 +768,15 @@ impl ComplianceContract {
         env.storage()
             .instance()
             .set(&DataKey::AllowlistMeta, &(page_idx, page_len));
+
+        let count: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::AllowlistCount)
+            .unwrap_or(0u32);
+        env.storage()
+            .instance()
+            .set(&DataKey::AllowlistCount, &(count + 1));
     }
 
     /// Remove an address from whichever page it lives on. Leaves the page
@@ -488,6 +829,15 @@ impl ComplianceContract {
         env.storage()
             .persistent()
             .remove(&DataKey::AllowlistPageOf(address.clone()));
+
+        let count: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::AllowlistCount)
+            .unwrap_or(0u32);
+        env.storage()
+            .instance()
+            .set(&DataKey::AllowlistCount, &count.saturating_sub(1));
     }
 }
 

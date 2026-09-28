@@ -79,6 +79,7 @@ fn test_register_before_init_panics_not_initialized() {
     );
 }
 
+
 #[test]
 fn test_register_and_get_asset() {
     let (env, client, _admin) = setup();
@@ -164,6 +165,14 @@ fn test_get_assets_by_issuer() {
     register(&env, &client, &bob, "invoice", 5);
     assert_eq!(client.get_assets_by_issuer(&alice).len(), 2);
     assert_eq!(client.get_assets_by_issuer(&bob).len(), 1);
+}
+
+#[test]
+fn test_get_assets_by_issuer_with_no_assets_returns_empty() {
+    let (env, client, _admin) = setup();
+    let issuer = Address::generate(&env);
+    let result = client.get_assets_by_issuer(&issuer);
+    assert_eq!(result.len(), 0);
 }
 
 #[test]
@@ -282,6 +291,35 @@ fn test_active_count_excludes_deactivated() {
     client.deactivate_asset(&admin, &a);
     assert_eq!(client.active_count(), 1);
     assert_eq!(client.asset_count(), 2);
+}
+
+#[test]
+fn test_active_count_matches_asset_count_after_deactivations() {
+    // Stresses the asset_count()/active_count() invariant across a sequence
+    // of deactivations, not just a single before/after snapshot.
+    let (env, client, admin) = setup();
+    let issuer = Address::generate(&env);
+
+    let mut ids = Vec::new(&env);
+    for _ in 0..5 {
+        ids.push_back(register(&env, &client, &issuer, "real_estate", 100));
+    }
+
+    assert_eq!(client.asset_count(), 5);
+    assert_eq!(client.active_count(), 5);
+    assert_eq!(client.asset_count() - client.active_count(), 0);
+
+    let mut deactivated = 0u64;
+    for id in ids.iter() {
+        client.deactivate_asset(&admin, &id);
+        deactivated += 1;
+        assert_eq!(client.asset_count(), 5);
+        assert_eq!(client.active_count(), 5 - deactivated);
+        assert_eq!(client.asset_count() - client.active_count(), deactivated);
+    }
+
+    assert_eq!(client.active_count(), 0);
+    assert_eq!(client.asset_count() - client.active_count(), 5);
 }
 
 #[test]
@@ -407,4 +445,328 @@ fn test_deactivate_already_inactive_asset_is_noop() {
     assert_eq!(client.active_count(), 0);
     assert_eq!(client.total_value_locked(), 0);
     assert!(!client.get_asset(&id).active);
+}
+
+// ---- admin handover (issue #4) ----
+
+#[test]
+fn test_propose_accept_admin_moves_role_only_on_acceptance() {
+    let (env, client, admin) = setup();
+    let successor = Address::generate(&env);
+
+    client.propose_admin(&admin, &successor);
+    // Role must not move until accepted.
+    assert_eq!(client.get_admin(), admin);
+    assert_eq!(client.get_pending_admin(), Some(successor.clone()));
+
+    client.accept_admin(&successor);
+    assert_eq!(client.get_admin(), successor);
+    assert_eq!(client.get_pending_admin(), None);
+
+    // The old admin has lost its privileges.
+    let issuer = Address::generate(&env);
+    let token = Address::generate(&env);
+    client.register_asset(
+        &issuer,
+        &token,
+        &String::from_str(&env, "Asset"),
+        &String::from_str(&env, "real_estate"),
+        &1_000,
+    );
+    let res = client.try_deactivate_asset(&admin, &1);
+    assert_eq!(res, Err(Ok(Error::Unauthorized.into())));
+    // The new admin can act.
+    client.deactivate_asset(&successor, &1);
+}
+
+#[test]
+fn test_cancel_admin_proposal_by_current_admin() {
+    let (env, client, admin) = setup();
+    let successor = Address::generate(&env);
+
+    client.propose_admin(&admin, &successor);
+    client.cancel_admin_proposal(&admin);
+    assert_eq!(client.get_pending_admin(), None);
+
+    // The cancelled successor can no longer accept.
+    let res = client.try_accept_admin(&successor);
+    assert_eq!(res, Err(Ok(Error::NoPendingAdmin.into())));
+    // The admin is unchanged.
+    assert_eq!(client.get_admin(), admin);
+}
+
+#[test]
+fn test_cancel_admin_proposal_with_nothing_pending_fails() {
+    let (_env, client, admin) = setup();
+    let res = client.try_cancel_admin_proposal(&admin);
+    assert_eq!(res, Err(Ok(Error::NoPendingAdmin.into())));
+}
+
+#[test]
+fn test_non_admin_cannot_propose_admin() {
+    let (env, client, _admin) = setup();
+    let non_admin = Address::generate(&env);
+    let successor = Address::generate(&env);
+    let res = client.try_propose_admin(&non_admin, &successor);
+    assert_eq!(res, Err(Ok(Error::Unauthorized.into())));
+}
+
+#[test]
+fn test_non_admin_cannot_cancel_admin_proposal() {
+    let (env, client, admin) = setup();
+    let non_admin = Address::generate(&env);
+    let successor = Address::generate(&env);
+    client.propose_admin(&admin, &successor);
+    let res = client.try_cancel_admin_proposal(&non_admin);
+    assert_eq!(res, Err(Ok(Error::Unauthorized.into())));
+}
+
+#[test]
+fn test_only_proposed_successor_can_accept() {
+    let (env, client, admin) = setup();
+    let successor = Address::generate(&env);
+    let impostor = Address::generate(&env);
+
+    client.propose_admin(&admin, &successor);
+    let res = client.try_accept_admin(&impostor);
+    assert_eq!(res, Err(Ok(Error::Unauthorized.into())));
+    // Role is unaffected by the failed attempt.
+    assert_eq!(client.get_admin(), admin);
+}
+
+#[test]
+fn test_accept_admin_with_no_pending_proposal_fails() {
+    let (env, client, _admin) = setup();
+    let stranger = Address::generate(&env);
+    let res = client.try_accept_admin(&stranger);
+    assert_eq!(res, Err(Ok(Error::NoPendingAdmin.into())));
+}
+
+#[test]
+fn test_reactivate_asset_restores_tvl_and_active_count() {
+    // Deactivation must not be permanent — reactivation restores TVL and
+    // active_count for the same asset id.
+    let (env, client, admin) = setup();
+    let issuer = Address::generate(&env);
+    let id = register(&env, &client, &issuer, "bond", 100);
+
+    client.deactivate_asset(&admin, &id);
+    assert_eq!(client.total_value_locked(), 0);
+    assert_eq!(client.active_count(), 0);
+    assert!(!client.get_asset(&id).active);
+
+    client.reactivate_asset(&admin, &id);
+    assert_eq!(client.total_value_locked(), 100);
+    assert_eq!(client.active_count(), 1);
+    assert!(client.get_asset(&id).active);
+}
+
+#[test]
+fn test_reactivate_already_active_asset_is_noop() {
+    let (env, client, admin) = setup();
+    let issuer = Address::generate(&env);
+    let id = register(&env, &client, &issuer, "bond", 100);
+
+    client.reactivate_asset(&admin, &id);
+    assert_eq!(client.total_value_locked(), 100);
+    assert_eq!(client.active_count(), 1);
+    assert!(client.get_asset(&id).active);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #3)")]
+fn test_reactivate_requires_admin() {
+    let (env, client, admin) = setup();
+    let issuer = Address::generate(&env);
+    let id = register(&env, &client, &issuer, "bond", 100);
+    client.deactivate_asset(&admin, &id);
+    client.reactivate_asset(&issuer, &id);
+}
+
+#[test]
+fn test_reactivate_unknown_id_fails() {
+    let (_env, client, admin) = setup();
+    assert_eq!(
+        client.try_reactivate_asset(&admin, &999u64),
+        Err(Ok(Error::AssetNotFound.into()))
+    );
+}
+
+#[test]
+fn test_tvl_running_total_matches_full_recomputation() {
+    // TVL must stay O(1) to read while remaining correct across every
+    // mutation. Prove the running total always equals a brute-force
+    // recomputation over every asset (active only) via get_all_assets.
+    let (env, client, admin) = setup();
+    let issuer = Address::generate(&env);
+    let a = register(&env, &client, &issuer, "real_estate", 100);
+    let b = register(&env, &client, &issuer, "invoice", 250);
+    let c = register(&env, &client, &issuer, "commodity", 75);
+
+    let recompute = |client: &RegistryContractClient| -> i128 {
+        client
+            .get_all_assets(&0, &1000)
+            .iter()
+            .filter(|e| e.active)
+            .map(|e| e.valuation)
+            .sum()
+    };
+
+    assert_eq!(client.total_value_locked(), recompute(&client));
+
+    client.deactivate_asset(&admin, &b);
+    assert_eq!(client.total_value_locked(), recompute(&client));
+
+    client.reactivate_asset(&admin, &b);
+    assert_eq!(client.total_value_locked(), recompute(&client));
+
+    client.deactivate_asset(&admin, &a);
+    client.deactivate_asset(&admin, &c);
+    assert_eq!(client.total_value_locked(), recompute(&client));
+
+    client.reactivate_asset(&admin, &a);
+    assert_eq!(client.total_value_locked(), recompute(&client));
+}
+
+#[test]
+fn test_get_assets_by_type_is_case_sensitive() {
+    // Matching rule for get_assets_by_type: byte-exact, so case must matter.
+    let (env, client, _admin) = setup();
+    let issuer = Address::generate(&env);
+    register(&env, &client, &issuer, "real_estate", 5);
+
+    assert_eq!(
+        client
+            .get_assets_by_type(&String::from_str(&env, "real_estate"))
+            .len(),
+        1
+    );
+    assert_eq!(
+        client
+            .get_assets_by_type(&String::from_str(&env, "Real_Estate"))
+            .len(),
+        0
+    );
+    assert_eq!(
+        client
+            .get_assets_by_type(&String::from_str(&env, "REAL_ESTATE"))
+            .len(),
+        0
+    );
+}
+
+#[test]
+fn test_get_assets_by_type_is_whitespace_sensitive() {
+    let (env, client, _admin) = setup();
+    let issuer = Address::generate(&env);
+    register(&env, &client, &issuer, "invoice", 5);
+
+    assert_eq!(
+        client
+            .get_assets_by_type(&String::from_str(&env, "invoice"))
+            .len(),
+        1
+    );
+    assert_eq!(
+        client
+            .get_assets_by_type(&String::from_str(&env, " invoice"))
+            .len(),
+        0
+    );
+    assert_eq!(
+        client
+            .get_assets_by_type(&String::from_str(&env, "invoice "))
+            .len(),
+        0
+    );
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #7)")]
+fn test_register_rejects_asset_type_with_whitespace() {
+    // A padded variant of a valid type must still be rejected at
+    // registration, not silently normalised.
+    let (env, client, _admin) = setup();
+    let issuer = Address::generate(&env);
+    register(&env, &client, &issuer, "invoice ", 100);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #7)")]
+fn test_register_rejects_asset_type_with_wrong_case() {
+    let (env, client, _admin) = setup();
+    let issuer = Address::generate(&env);
+    register(&env, &client, &issuer, "Invoice", 100);
+}
+
+#[test]
+fn test_duplicate_registration_does_not_double_count_tvl() {
+    let (env, client, _admin) = setup();
+    let issuer = Address::generate(&env);
+    register(&env, &client, &issuer, "real_estate", 100);
+    assert_eq!(client.total_value_locked(), 100);
+    assert_eq!(client.asset_count(), 1);
+}
+
+/// Registering the same token contract twice must be rejected, otherwise TVL
+/// and any client reading `get_all_assets` would double-count the same
+/// underlying asset under two distinct registry ids.
+#[test]
+#[should_panic(expected = "Error(Contract, #9)")]
+fn test_duplicate_token_contract_registration_rejected() {
+    let (env, client, _admin) = setup();
+    let issuer = Address::generate(&env);
+    let token = Address::generate(&env);
+    client.register_asset(
+        &issuer,
+        &token,
+        &String::from_str(&env, "Asset One"),
+        &String::from_str(&env, "real_estate"),
+        &100,
+    );
+    // Same token_contract, even under a different issuer/name, must be rejected.
+    let other_issuer = Address::generate(&env);
+    client.register_asset(
+        &other_issuer,
+        &token,
+        &String::from_str(&env, "Asset One Again"),
+        &String::from_str(&env, "invoice"),
+        &200,
+    );
+}
+
+/// `limit` beyond `MAX_PAGE_SIZE` is silently clamped, bounding response size
+/// regardless of what a caller requests.
+#[test]
+fn test_get_all_assets_enforces_max_page_size() {
+    let (env, client, _admin) = setup();
+    let issuer = Address::generate(&env);
+    for i in 0..5 {
+        register(&env, &client, &issuer, "real_estate", 100 + i);
+    }
+    // Requesting far more than exist, and far more than MAX_PAGE_SIZE, still
+    // only returns what's actually registered (small-registry call keeps working).
+    let result = client.get_all_assets(&1, &(MAX_PAGE_SIZE * 10));
+    assert_eq!(result.len(), 5);
+}
+
+/// The final page of a paginated walk may be partial (fewer than `limit`
+/// items) once it reaches the end of the registry.
+#[test]
+fn test_get_all_assets_final_partial_page() {
+    let (env, client, _admin) = setup();
+    let issuer = Address::generate(&env);
+    for i in 0..7 {
+        register(&env, &client, &issuer, "real_estate", 100 + i);
+    }
+    let page_size = 3u32;
+    let first = client.get_all_assets(&1, &page_size);
+    assert_eq!(first.len(), 3);
+    let second = client.get_all_assets(&4, &page_size);
+    assert_eq!(second.len(), 3);
+    // Final page is partial: only 1 asset remains (7 total, 6 already read).
+    let third = client.get_all_assets(&7, &page_size);
+    assert_eq!(third.len(), 1);
+    let fourth = client.get_all_assets(&8, &page_size);
+    assert_eq!(fourth.len(), 0);
 }
