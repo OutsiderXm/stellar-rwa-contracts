@@ -10,6 +10,32 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  changelog:
+    # Contract source changes must come with a CHANGELOG.md entry so the
+    # changelog can't drift as contribution rate grows. See CONTRIBUTING.md
+    # for the convention. Only runs on pull requests, where a base ref exists.
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Require CHANGELOG entry for contract changes
+        run: |
+          BASE="origin/${{ github.base_ref }}"
+          git fetch --no-tags origin "${{ github.base_ref }}"
+          CHANGED=$(git diff --name-only "$BASE...HEAD")
+          echo "Changed files:"
+          echo "$CHANGED"
+          if echo "$CHANGED" | grep -qE '^contracts/'; then
+            if ! echo "$CHANGED" | grep -qE '^CHANGELOG\.md$'; then
+              echo "::error::This PR touches contracts/ but does not modify CHANGELOG.md. Add an entry under the Unreleased section (see CONTRIBUTING.md)."
+              exit 1
+            fi
+          fi
+          echo "Changelog check passed."
+
   test:
     runs-on: ubuntu-latest
     steps:
@@ -90,6 +116,37 @@ jobs:
               fi
             fi
           done
+
+  interface-specs:
+    # Publishes the contract interface specification (one spec per contract) as
+    # a consumable build artifact so the web app and API can generate bindings
+    # from a single source of truth instead of hand-maintaining their own view
+    # of the interfaces. See CONTRIBUTING.md for how to consume the artifact.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Rust
+        run: rustup show
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-specs-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Emit interface specs
+        run: make interface-specs
+
+      - name: Upload interface specs
+        uses: actions/upload-artifact@v4
+        with:
+          name: interface-specs
+          path: target/interface-specs/*.json
+          if-no-files-found: error
 
   coverage:
     runs-on: ubuntu-latest

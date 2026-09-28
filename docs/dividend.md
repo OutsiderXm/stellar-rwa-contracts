@@ -14,8 +14,11 @@ At claim time a holder can claim:
 claimable = total_amount * balance(holder) / total_supply
 ```
 
-where `balance` and `total_supply` are read live from the asset token. Integer
-division floors the result. Each holder can claim a given distribution **once**.
+where `balance` and `total_supply` are represented in the asset token's raw
+integer units. Integer division floors the result. With an asset token using
+zero decimals, fractional holdings cannot be represented and a small claim can
+round to zero, making it unclaimable. Each holder can claim a given
+distribution **once**.
 
 ## `Distribution`
 
@@ -60,6 +63,9 @@ pub trait TokenInterface {
 - `claim(distribution_id, holder)` — holder auth; pays the claimable amount from
   escrow, marks claimed, updates `distributed`/`completed`. Errors:
   `AlreadyClaimed (#7)`, `NothingToClaim (#6)`.
+- `cancel_distribution(admin, distribution_id)` — admin auth; returns escrowed
+  funds to the issuer. Only works while nothing has been claimed (`distributed == 0`).
+  Errors: `InvalidAmount (#5)` if any claim has been made.
 - `get_distribution(distribution_id) -> Distribution` — `DistributionNotFound (#4)`.
 - `get_distributions_for_asset(asset_token) -> Vec<Distribution>`
 - `has_claimed(distribution_id, holder) -> bool`
@@ -88,18 +94,27 @@ pub trait TokenInterface {
 | `init`    | admin                      | initialize          |
 | `created` | (admin) → (id, total)      | distribution funded |
 | `claim`   | (holder) → (id, amount)    | holder claims       |
+| `cancel`  | (admin) → distribution_id  | distribution cancelled |
 
 ## Storage / TTL
 
-Listing of the contract `DataKey` variants and their storage behaviour.
+Listing of the contract `DataKey` variants and their storage behaviour. This
+table is generated from the `DataKey` enum in `contracts/dividend/src/lib.rs`
+via `scripts/generate_storage_docs.py` and reflects the snapshot-based
+distribution model (issue #163): `Snapshot` and `Supply` freeze the
+entitlement basis at `create_distribution` time, and `AssetIds` indexes
+distributions per asset token (issue #166).
 
 | Key | Payload | Storage | TTL / Notes |
 |-----|---------|---------|-------------|
-| `Admin` | - | instance | - |
-| `Counter` | - | instance | - |
-| `Ids` | - | unknown | - |
-| `Dist` | u64 | persistent | extended via instance() |
-| `Claimed` | u64, Address | unknown | per-key TTL |
+| `Admin` | - | instance | set once in `initialize`; never removed |
+| `Counter` | - | instance | monotonically increasing distribution id |
+| `Ids` | - | unused | legacy variant kept in the enum for ABI/storage-key stability; not read or written by any function |
+| `Dist(u64)` | distribution id | persistent | `extend_ttl` on create and on every `claim`/`complete` update |
+| `Claimed(u64, Address)` | distribution id, holder | persistent | set once per `(distribution, holder)` on `claim`; no explicit `extend_ttl` call |
+| `AssetIds(Address)` | asset token | persistent | `Vec<u64>` of distribution ids for that asset token; appended and TTL-extended on every `create_distribution` |
+| `Supply(u64)` | distribution id | persistent | snapshot total supply (the `claimable` denominator), frozen at creation; TTL-extended on create; removed once the distribution completes |
+| `Snapshot(u64)` | distribution id | persistent | the frozen `eligible: Vec<(Address, i128)>` entitlement list; TTL-extended on create; removed once the distribution completes |
 
 ## Security considerations
 

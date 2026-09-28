@@ -1,43 +1,39 @@
 # Deployments
 
-Live contract addresses for the Stellar RWA Toolkit contracts.
+This file records the deployed contract ids for each network so that anyone
+can audit a deployment against the repository.
 
 ## Testnet
 
-Network: `Test SDF Network ; September 2015`
-Deployed: 2026-07-08
+| Contract    | Id |
+| ----------- | -- |
+| compliance  | _TBD_ |
+| registry    | _TBD_ |
+| dividend    | _TBD_ |
+| asset-token | _TBD_ |
 
-| Contract    | Contract ID                                                | Explorer |
-|-------------|------------------------------------------------------------|----------|
-| compliance  | `CBUERYDM7DXTZLLKDBRJKUBPFJ7M4OSUN4T7XKUARU345RLXNAIQD2IU` | [view](https://stellar.expert/explorer/testnet/contract/CBUERYDM7DXTZLLKDBRJKUBPFJ7M4OSUN4T7XKUARU345RLXNAIQD2IU) |
-| registry    | `CBX5SMLTXX6JP4HA5GQIO2V6QM7WCUGL2GZ6D4U773HMRI6RXISKPUR3` | [view](https://stellar.expert/explorer/testnet/contract/CBX5SMLTXX6JP4HA5GQIO2V6QM7WCUGL2GZ6D4U773HMRI6RXISKPUR3) |
-| dividend    | `CAR4XY3CEBQWFOL27JEWFW34KXSIZA7RFKDQMEIV7ZU723RWY37I2SYX` | [view](https://stellar.expert/explorer/testnet/contract/CAR4XY3CEBQWFOL27JEWFW34KXSIZA7RFKDQMEIV7ZU723RWY37I2SYX) |
-| asset-token | `CBMCWLSQSWUTLUJFCNBHNBSXMUM3XU7NAQ5TSNERW4HA4ZZBYHLG4ECZ` | [view](https://stellar.expert/explorer/testnet/contract/CBMCWLSQSWUTLUJFCNBHNBSXMUM3XU7NAQ5TSNERW4HA4ZZBYHLG4ECZ) |
+Deployments are produced by `scripts/deploy.sh`; copy the printed ids into the
+table above.
 
-**Admin / issuer account:** `GAIQGTOBTTLLDJ4SWGGESM7UWJ2DI4K3ZNHUSHPDKJL2IE5FKY3BSRAA`
+## Verifying a deployment
 
-### Sample asset
+To confirm that a deployed contract matches a given commit of this repository,
+use `scripts/verify-deployment.sh`. It builds the wasm at the requested commit
+and compares its hash against the on-chain wasm hash of the deployed contract.
 
-The deployment script registers one sample asset for demonstration:
+```sh
+# Verify a contract against the current HEAD
+./scripts/verify-deployment.sh <contract-id>
 
-- **Name:** Manhattan Loft (`MLOFT`)
-- **Type:** `real_estate`
-- **Total supply:** 1,000,000 (2 decimals)
-- **Valuation:** 500,000,000 USD cents ($5,000,000)
-- **Compliance:** gated by the compliance contract above; the admin/issuer is
-  the only KYC-approved holder at deploy time.
+# Verify a contract against a specific commit
+./scripts/verify-deployment.sh <contract-id> <commit>
 
-## Reproducing
-
-```bash
-NETWORK=testnet IDENTITY=rwa-admin ./scripts/deploy.sh
+# Verify against a non-default network
+NETWORK=testnet ./scripts/verify-deployment.sh <contract-id> <commit>
 ```
 
-The script funds a fresh identity via friendbot, builds the wasm, deploys and
-initializes all four contracts, approves the issuer on the compliance contract,
-deploys a sample asset token, and registers it in the registry. It prints the
-resulting contract ids; paste them into this file.
+The script prints `MATCH` when the locally built wasm matches the deployed
+contract and `MISMATCH` otherwise, exiting non-zero on a mismatch so it can be
+used in CI or audit scripts.
 
-## Mainnet
-
-Not yet deployed.
+Requirements: `stellar` CLI (>= 22), `git`, and `sha256sum` (or `shasum`).
