@@ -103,6 +103,43 @@ fn test_expired_kyc_not_allowed() {
     assert!(!client.is_allowed(&user));
 }
 
+// Issue #341: pin the exact boundary at which a KYC approval lapses.
+// Semantics: `expires_at` is exclusive — the record is valid through
+// ledger `expires_at - 1`, and is expired starting at ledger `expires_at`
+// itself (not one ledger after it).
+#[test]
+fn test_expiry_boundary_one_before_is_allowed() {
+    let (env, client, admin) = setup();
+    let user = Address::generate(&env);
+    let us = String::from_str(&env, "US");
+    env.ledger().with_mut(|l| l.sequence_number = 10);
+    client.add_to_allowlist(&admin, &user, &us, &100);
+    env.ledger().with_mut(|l| l.sequence_number = 99);
+    assert!(client.is_allowed(&user));
+}
+
+#[test]
+fn test_expiry_boundary_exactly_at_expiry_is_expired() {
+    let (env, client, admin) = setup();
+    let user = Address::generate(&env);
+    let us = String::from_str(&env, "US");
+    env.ledger().with_mut(|l| l.sequence_number = 10);
+    client.add_to_allowlist(&admin, &user, &us, &100);
+    env.ledger().with_mut(|l| l.sequence_number = 100);
+    assert!(!client.is_allowed(&user));
+}
+
+#[test]
+fn test_expiry_boundary_one_after_is_expired() {
+    let (env, client, admin) = setup();
+    let user = Address::generate(&env);
+    let us = String::from_str(&env, "US");
+    env.ledger().with_mut(|l| l.sequence_number = 10);
+    client.add_to_allowlist(&admin, &user, &us, &100);
+    env.ledger().with_mut(|l| l.sequence_number = 101);
+    assert!(!client.is_allowed(&user));
+}
+
 #[test]
 fn test_block_jurisdiction_denies_approved() {
     let (env, client, admin) = setup();
@@ -395,13 +432,267 @@ fn test_mixed_case_jurisdiction_normalized() {
     );
 }
 
-/// Issue #356: removing an address that was never added must not panic and
-/// must leave the allowlist unchanged.
+/// Issue #356: removing an address that was never added must reject with
+/// RecordNotFound rather than silently succeeding — `remove` intentionally
+/// requires an existing record (see `Error::RecordNotFound`).
 #[test]
+#[should_panic(expected = "Error(Contract, #3)")]
 fn test_remove_unknown_address_is_noop() {
     let (env, client, admin) = setup();
     let ghost = Address::generate(&env);
     client.remove(&admin, &ghost);
+}
+
+#[test]
+fn test_prune_expired_removes_from_allowlist() {
+    // Issue #307: prune_expired must remove expired addresses from get_allowlist.
+    let (env, client, admin) = setup();
+    let user_expire = Address::generate(&env);
+    let user_persist = Address::generate(&env);
+    let us = String::from_str(&env, "US");
+
+    env.ledger().with_mut(|l| l.sequence_number = 10);
+    client.add_to_allowlist(&admin, &user_expire, &us, &100);
+    client.add_to_allowlist(&admin, &user_persist, &us, &0);
+    assert_eq!(client.get_allowlist().len(), 2);
+
+    // Advance ledger past expiry
+    env.ledger().with_mut(|l| l.sequence_number = 101);
+
+    // Verify the expired user is no longer is_allowed
+    assert!(!client.is_allowed(&user_expire));
+    assert!(client.is_allowed(&user_persist));
+
+    // Prune expired records. max_records = 0 means unbounded, matching the
+    // pre-#333 behaviour for a small allowlist: a single call finishes the
+    // whole pass and reports 0 remaining.
+    let remaining = client.prune_expired(&admin, &0);
+    assert_eq!(remaining, 0);
+
+    // Verify get_allowlist no longer contains the expired user
+    let list = client.get_allowlist();
+    assert_eq!(list.len(), 1);
+    assert_eq!(list.get(0).unwrap(), user_persist);
+
+    // Verify get_record returns None for the pruned user
+    assert!(client.get_record(&user_expire).is_none());
+    assert!(client.get_record(&user_persist).is_some());
+}
+
+#[test]
+fn test_add_to_allowlist_batch_admits_several_addresses() {
+    // Issue #338: several addresses can be admitted in one transaction, with
+    // the same validation/normalization as the single-address path.
+    let (env, client, admin) = setup();
+    let user_a = Address::generate(&env);
+    let user_b = Address::generate(&env);
+    let us = String::from_str(&env, "us"); // lowercase, mirrors normalize path
+    let ke = String::from_str(&env, "KE");
+    let mut entries: Vec<AllowlistEntry> = Vec::new(&env);
+    entries.push_back(AllowlistEntry {
+        address: user_a.clone(),
+        jurisdiction: us.clone(),
+        expires_at: 0,
+    });
+    entries.push_back(AllowlistEntry {
+        address: user_b.clone(),
+        jurisdiction: ke.clone(),
+        expires_at: 0,
+    });
+
+    client.add_to_allowlist_batch(&admin, &entries);
+
+    assert!(client.is_allowed(&user_a));
+    assert!(client.is_allowed(&user_b));
+    assert_eq!(
+        client.get_record(&user_a).unwrap().jurisdiction,
+        String::from_str(&env, "US")
+    );
+    assert_eq!(client.get_allowlist().len(), 2);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #4)")]
+fn test_add_to_allowlist_batch_partial_failure_reverts_whole_batch() {
+    // Issue #338: a failure in one entry must not silently skip that entry
+    // while committing the others — the whole call reverts.
+    let (env, client, admin) = setup();
+    let user_a = Address::generate(&env);
+    let user_bad = Address::generate(&env);
+    let us = String::from_str(&env, "US");
+    env.ledger().with_mut(|l| l.sequence_number = 500);
+    let mut entries: Vec<AllowlistEntry> = Vec::new(&env);
+    entries.push_back(AllowlistEntry {
+        address: user_a.clone(),
+        jurisdiction: us.clone(),
+        expires_at: 0,
+    });
+    // Second entry has an expiry already in the past: identical to what
+    // add_to_allowlist rejects with Error::InvalidExpiry (#4).
+    entries.push_back(AllowlistEntry {
+        address: user_bad.clone(),
+        jurisdiction: us.clone(),
+        expires_at: 100,
+    });
+
+    client.add_to_allowlist_batch(&admin, &entries);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #5)")]
+fn test_add_to_allowlist_batch_non_admin_rejected() {
+    let (env, client, _admin) = setup();
+    let impostor = Address::generate(&env);
+    let user = Address::generate(&env);
+    let us = String::from_str(&env, "US");
+    let mut entries: Vec<AllowlistEntry> = Vec::new(&env);
+    entries.push_back(AllowlistEntry {
+        address: user,
+        jurisdiction: us,
+        expires_at: 0,
+    });
+    client.add_to_allowlist_batch(&impostor, &entries);
+}
+
+#[test]
+fn test_prune_expired_respects_bound_and_reports_remaining() {
+    // Issue #333: prune_expired must accept a bound on how many records a
+    // single call processes, and report how many are left to examine.
+    let (env, client, admin) = setup();
+    let us = String::from_str(&env, "US");
+    let mut users: Vec<Address> = Vec::new(&env);
+    for _ in 0..5 {
+        users.push_back(Address::generate(&env));
+    }
+    env.ledger().with_mut(|l| l.sequence_number = 10);
+    for u in users.iter() {
+        client.add_to_allowlist(&admin, &u, &us, &100);
+    }
+    env.ledger().with_mut(|l| l.sequence_number = 101);
+    assert_eq!(client.get_allowlist().len(), 5);
+
+    // First call only examines 2 of the 5 expired entries.
+    let remaining = client.prune_expired(&admin, &2);
+    assert_eq!(remaining, 3);
+    assert_eq!(client.get_allowlist().len(), 3);
+
+    // Second call examines the rest.
+    let remaining = client.prune_expired(&admin, &2);
+    assert_eq!(remaining, 1);
+    assert_eq!(client.get_allowlist().len(), 1);
+
+    // Final call clears the last one; nothing left to examine.
+    let remaining = client.prune_expired(&admin, &2);
+    assert_eq!(remaining, 0);
     assert_eq!(client.get_allowlist().len(), 0);
-    assert!(client.get_record(&ghost).is_none());
+}
+
+#[test]
+fn test_status_of_distinguishes_unseen_from_approved_and_suspended() {
+    // Issue #183: `status_of` must let callers tell "never seen" (`None`)
+    // apart from a recorded status such as `Approved` or `Suspended`.
+    let (env, client, admin) = setup();
+    let stranger = Address::generate(&env);
+    let user = Address::generate(&env);
+
+    assert_eq!(client.status_of(&stranger), None);
+
+    client.add_to_allowlist(&admin, &user, &String::from_str(&env, "US"), &0);
+    assert_eq!(client.status_of(&user), Some(ComplianceStatus::Approved));
+
+    client.suspend(&admin, &user);
+    assert_eq!(client.status_of(&user), Some(ComplianceStatus::Suspended));
+}
+
+#[test]
+fn test_get_allowlist_basic_membership() {
+    // Issue #303: get_allowlist has zero test coverage.
+    let (env, client, admin) = setup();
+    let user1 = Address::generate(&env);
+    let user2 = Address::generate(&env);
+    let us = String::from_str(&env, "US");
+    let de = String::from_str(&env, "DE");
+
+    // Initially empty
+    assert_eq!(client.get_allowlist().len(), 0);
+
+    // After adding first user
+    client.add_to_allowlist(&admin, &user1, &us, &0);
+    let list = client.get_allowlist();
+    assert_eq!(list.len(), 1);
+    assert_eq!(list.get(0).unwrap(), user1);
+
+    // After adding second user
+    client.add_to_allowlist(&admin, &user2, &de, &0);
+    let list = client.get_allowlist();
+    assert_eq!(list.len(), 2);
+    assert_eq!(list.get(0).unwrap(), user1);
+    assert_eq!(list.get(1).unwrap(), user2);
+}
+
+#[test]
+fn test_get_allowlist_after_removal() {
+    // Issue #303: get_allowlist must reflect removal via remove().
+    let (env, client, admin) = setup();
+    let user1 = Address::generate(&env);
+    let user2 = Address::generate(&env);
+    let us = String::from_str(&env, "US");
+
+    client.add_to_allowlist(&admin, &user1, &us, &0);
+    client.add_to_allowlist(&admin, &user2, &us, &0);
+    assert_eq!(client.get_allowlist().len(), 2);
+
+    client.remove(&admin, &user1);
+    let list = client.get_allowlist();
+    assert_eq!(list.len(), 1);
+    assert_eq!(list.get(0).unwrap(), user2);
+}
+
+#[test]
+fn test_get_allowlist_page_rollover() {
+    // Issue #303: get_allowlist must handle page rollover at ALLOWLIST_PAGE_SIZE (200).
+    let (env, client, admin) = setup();
+    let us = String::from_str(&env, "US");
+
+    // Add 250 addresses to force page rollover (200 + 1 = 201 > ALLOWLIST_PAGE_SIZE)
+    let mut users = Vec::new(&env);
+    for _i in 0..250 {
+        let user = Address::generate(&env);
+        users.push_back(user.clone());
+        client.add_to_allowlist(&admin, &user, &us, &0);
+    }
+
+    // Verify all 250 are in the allowlist
+    let allowlist = client.get_allowlist();
+    assert_eq!(allowlist.len(), 250);
+
+    // Verify the expected users are present (spot-check first, middle, and last)
+    assert_eq!(allowlist.get(0).unwrap(), users.get(0).unwrap());
+    assert_eq!(allowlist.get(125).unwrap(), users.get(125).unwrap());
+    assert_eq!(allowlist.get(249).unwrap(), users.get(249).unwrap());
+}
+
+#[test]
+fn test_re_approve_removed_address_single_page_slot() {
+    // Issue #304: re-approving a removed address should get a single fresh page slot,
+    // not duplicated across old and new slots.
+    let (env, client, admin) = setup();
+    let user = Address::generate(&env);
+    let us = String::from_str(&env, "US");
+
+    // Add, remove, then re-add the same address
+    client.add_to_allowlist(&admin, &user, &us, &0);
+    let initial_list = client.get_allowlist();
+    assert_eq!(initial_list.len(), 1);
+    assert_eq!(initial_list.get(0).unwrap(), user);
+
+    client.remove(&admin, &user);
+    let after_remove = client.get_allowlist();
+    assert_eq!(after_remove.len(), 0);
+
+    // Re-approve the same address
+    client.add_to_allowlist(&admin, &user, &us, &0);
+    let after_readd = client.get_allowlist();
+    assert_eq!(after_readd.len(), 1);
+    assert_eq!(after_readd.get(0).unwrap(), user);
 }

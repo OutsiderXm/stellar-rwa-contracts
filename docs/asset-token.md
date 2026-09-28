@@ -145,3 +145,15 @@ Listing of the contract `DataKey` variants and their storage behaviour.
 - Repointing compliance with `set_compliance` changes the effective approval set
   immediately; see "Swapping compliance mid-life" above for the operational
   consequences and the recommended migration procedure.
+
+## Edge-case policy decisions
+
+These behaviours were previously implicit/accidental; they are now
+deliberate and pinned by tests in `contracts/asset-token/src/test.rs`.
+
+| Case | Decision | Rationale | Test |
+|------|----------|-----------|------|
+| Zero-amount `transfer`/`mint`/`burn` | **Rejected** with `InvalidAmount` (#5) | A no-op call that still emits an event and costs fees is misleading; callers must skip the call instead. | `test_zero_amount_rejected` |
+| Self-transfer (`from == to`) | **Allowed**, short-circuited to a true no-op (balances untouched, event still emitted) | Rejecting it forces callers to special-case an address match themselves; a no-op is safe and simpler, and avoids a double-apply bug in naive debit/credit code. | `test_self_transfer_no_inflation`, `test_self_transfer_exceeding_balance_fails`, `test_self_transfer_by_suspended_holder_fails` |
+| Burn by a suspended/non-compliant holder | **Rejected** with `SenderNotCompliant` (#7) | `burn` still mutates balance and total supply, so it is gated exactly like the `from` side of a `transfer`; suspension cannot be bypassed via self-burn. | `test_burn_blocked_when_holder_not_compliant`, `test_burn_blocked_when_holder_suspended` |
+| Mint to a non-compliant recipient | **Rejected** with `RecipientNotCompliant` (#8) | Minting is the only way new supply enters circulation; leaving it ungated would let tokens reach an address no `transfer` could ever reach. `mint_batch` applies the same check per recipient. | `test_mint_to_noncompliant_fails`, `test_mint_batch_reverts_entirely_on_noncompliant_recipient` |

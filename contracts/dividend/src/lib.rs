@@ -10,6 +10,10 @@
 //! entitlement is sized against this snapshot rather than live balances, preventing
 //! post-creation transfers from inflating or diluting any holder's claim.
 //! `created_at` records the ledger at which the distribution was created for reference.
+//!
+//! Entitlements use integer token units and integer division. If the asset token
+//! has zero decimals, it cannot represent fractional holdings, and a small
+//! proportional payment may round down to zero and be unclaimable.
 
 #[cfg(test)]
 extern crate std;
@@ -151,6 +155,10 @@ impl DividendContract {
         if total_amount <= 0 {
             panic_err(&env, Error::InvalidAmount);
         }
+        // Reject distributions with empty eligible set (issue #365).
+        if eligible.len() == 0 {
+            panic_err(&env, Error::InvalidAmount);
+        }
         // Reject distributions where no holder can ever claim (issue #49).
         let supply = AssetClient::new(&env, &asset_token).total_supply();
         if supply <= 0 {
@@ -258,7 +266,8 @@ impl DividendContract {
         if basis <= 0 {
             return 0;
         }
-        // Proportional share, floored by integer division. Guard the
+        // Proportional share, floored by integer division. For zero-decimal
+        // asset tokens this can make small claims equal to zero. Guard the
         // multiplication against i128 overflow (issue #165).
         dist.total_amount
             .checked_mul(basis)
@@ -314,6 +323,34 @@ impl DividendContract {
         bump(&env);
         env.events()
             .publish((symbol_short!("claim"), holder), (distribution_id, amount));
+    }
+
+    /// Cancel a distribution and return escrowed funds to the issuer.
+    /// Only works while nothing has been claimed (distributed == 0). Admin only.
+    pub fn cancel_distribution(env: Env, admin: Address, distribution_id: u64) {
+        Self::require_admin(&env, &admin);
+        let dist = Self::load(&env, distribution_id);
+        // Only allow cancellation before any claim is made (issue #366).
+        if dist.distributed > 0 {
+            panic_err(&env, Error::InvalidAmount);
+        }
+        // Return escrowed funds to the issuer.
+        let this = env.current_contract_address();
+        TokenClient::new(&env, &dist.payment_token).transfer(&this, &admin, &dist.total_amount);
+        // Mark as completed so no further claims are possible.
+        let mut cancelled_dist = dist;
+        cancelled_dist.completed = true;
+        env.storage()
+            .persistent()
+            .set(&DataKey::Dist(distribution_id), &cancelled_dist);
+        env.storage().persistent().extend_ttl(
+            &DataKey::Dist(distribution_id),
+            INSTANCE_LIFETIME_THRESHOLD,
+            INSTANCE_BUMP_AMOUNT,
+        );
+        bump(&env);
+        env.events()
+            .publish((symbol_short!("cancel"), admin), distribution_id);
     }
 
     /// Fetch a distribution by id.
