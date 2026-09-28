@@ -23,6 +23,17 @@ pub enum ComplianceStatus {
     Suspended,
 }
 
+/// One entry of an [`ComplianceContract::add_to_allowlist_batch`] call. Mirrors
+/// the parameters of [`ComplianceContract::add_to_allowlist`] exactly, so each
+/// entry is validated the same way it would be if submitted individually.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AllowlistEntry {
+    pub address: Address,
+    pub jurisdiction: String,
+    pub expires_at: u32,
+}
+
 /// A single KYC record for an address.
 #[contracttype]
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -165,6 +176,74 @@ impl ComplianceContract {
         );
     }
 
+    /// Add (or re-approve) several addresses on the KYC allowlist in one
+    /// transaction (issue #338). Each [`AllowlistEntry`] carries its own
+    /// `jurisdiction` and `expires_at`, so every entry is validated and
+    /// normalized exactly as [`Self::add_to_allowlist`] validates a single
+    /// address: same expiry check, same jurisdiction normalization, same
+    /// audit-trail capture, same per-address `approved` event.
+    ///
+    /// If any entry fails validation (e.g. its `expires_at` is in the past,
+    /// or its jurisdiction is malformed), the call panics immediately with
+    /// the same error the single-address path would raise for that entry.
+    /// Soroban rolls back all state changes made earlier in the same
+    /// invocation when it panics, so a failing entry never silently skips
+    /// itself while leaving earlier entries in the batch committed — the
+    /// whole batch either fully applies or fully reverts.
+    pub fn add_to_allowlist_batch(env: Env, admin: Address, entries: Vec<AllowlistEntry>) {
+        Self::require_admin(&env, &admin);
+        let now = env.ledger().sequence();
+
+        for entry in entries.iter() {
+            let address = entry.address;
+            let expires_at = entry.expires_at;
+            if expires_at != 0 && expires_at <= now {
+                panic_with_error(&env, Error::InvalidExpiry);
+            }
+            let jurisdiction = normalize_jurisdiction(&env, &entry.jurisdiction);
+
+            let prev: Option<KycRecord> = env
+                .storage()
+                .persistent()
+                .get(&DataKey::Record(address.clone()));
+
+            let record = KycRecord {
+                address: address.clone(),
+                status: ComplianceStatus::Approved,
+                jurisdiction: jurisdiction.clone(),
+                verified_at: now,
+                expires_at,
+            };
+            env.storage()
+                .persistent()
+                .set(&DataKey::Record(address.clone()), &record);
+
+            if prev.is_none() {
+                Self::append_to_allowlist(&env, &address);
+            }
+
+            let (prev_jurisdiction, prev_expires_at, was_suspended) = match prev {
+                Some(ref r) => (
+                    r.jurisdiction.clone(),
+                    r.expires_at,
+                    r.status == ComplianceStatus::Suspended,
+                ),
+                None => (jurisdiction.clone(), 0u32, false),
+            };
+            env.events().publish(
+                (symbol_short!("approved"), address),
+                (
+                    jurisdiction,
+                    expires_at,
+                    prev_jurisdiction,
+                    prev_expires_at,
+                    was_suspended,
+                ),
+            );
+        }
+        Self::bump_instance(&env);
+    }
+
     /// Suspend an approved address. Its record is retained but `is_allowed`
     /// returns `false` until it is re-approved.
     pub fn suspend(env: Env, admin: Address, address: Address) {
@@ -214,6 +293,11 @@ impl ComplianceContract {
             return false;
         }
         let now = env.ledger().sequence();
+        // Boundary semantics (issue #341): `expires_at` is exclusive. A record
+        // is still valid at `expires_at - 1`, and lapses starting exactly at
+        // ledger `expires_at` (i.e. `now >= expires_at` is expired, not
+        // `now > expires_at`). This matches `add_to_allowlist`, which already
+        // rejects `expires_at <= now` as already-expired at creation time.
         if record.expires_at != 0 && now >= record.expires_at {
             // Emit an expiry event so indexers can track the transition (issue #21).
             env.events()
@@ -307,17 +391,29 @@ impl ComplianceContract {
             .unwrap_or(false)
     }
 
-    /// Prune all expired records from the allowlist. Admin only (issue #21).
+    /// Prune expired records from the allowlist. Admin only (issue #21).
     /// Removes expired entries from persistent storage and the allowlist vector
     /// so indexers and `get_allowlist` no longer count them as Approved.
     ///
     /// Issue #306: previously iterated every allocated page unconditionally.
     /// We now skip absent or already-empty pages so cost scales with live
     /// pages, not historical page count.
-    pub fn prune_expired(env: Env, admin: Address) {
+    ///
+    /// Issue #333: a single invocation can still exceed host resource limits
+    /// once the allowlist is large enough, since the whole thing was scanned
+    /// in one call regardless of size. `max_records` bounds how many
+    /// individual allowlist entries this call will inspect before returning,
+    /// so a large allowlist can be pruned incrementally across several
+    /// transactions. Passing `0` means "no bound" (scan everything), which
+    /// preserves prior behaviour for small allowlists. The return value is
+    /// the number of entries left unexamined (i.e. still possibly expired
+    /// and not yet checked) once the bound is hit, so callers know whether
+    /// to invoke again; it is `0` once a full pass completes.
+    pub fn prune_expired(env: Env, admin: Address, max_records: u32) -> u32 {
         Self::require_admin(&env, &admin);
         let now = env.ledger().sequence();
         let (current_page, _) = Self::allowlist_meta(&env);
+        let mut examined: u32 = 0;
         for page_idx in 0..=current_page {
             let page: Option<Vec<Address>> = env
                 .storage()
@@ -329,7 +425,18 @@ impl ComplianceContract {
             };
             let mut next = Vec::new(&env);
             let mut changed = false;
+            let mut stopped_early = false;
+            let mut unexamined_in_page: u32 = 0;
             for addr in page.iter() {
+                if max_records != 0 && examined >= max_records {
+                    // Bound reached: keep this and every remaining entry in
+                    // the page untouched, to be examined on a later call.
+                    next.push_back(addr);
+                    stopped_early = true;
+                    unexamined_in_page += 1;
+                    continue;
+                }
+                examined += 1;
                 let record: Option<KycRecord> = env
                     .storage()
                     .persistent()
@@ -363,8 +470,25 @@ impl ComplianceContract {
                     .persistent()
                     .set(&DataKey::AllowlistPage(page_idx), &next);
             }
+            if stopped_early {
+                // Entries left unexamined in this page, plus every entry on
+                // pages not yet visited at all.
+                let mut total_remaining = unexamined_in_page;
+                for later_idx in (page_idx + 1)..=current_page {
+                    let later: Option<Vec<Address>> = env
+                        .storage()
+                        .persistent()
+                        .get(&DataKey::AllowlistPage(later_idx));
+                    if let Some(p) = later {
+                        total_remaining += p.len();
+                    }
+                }
+                Self::bump_instance(&env);
+                return total_remaining;
+            }
         }
         Self::bump_instance(&env);
+        0
     }
 
     /// Return the configured admin address.
