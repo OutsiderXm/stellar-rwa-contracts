@@ -10,6 +10,34 @@
 //! entitlement is sized against this snapshot rather than live balances, preventing
 //! post-creation transfers from inflating or diluting any holder's claim.
 //! `created_at` records the ledger at which the distribution was created for reference.
+//!
+//! Entitlements use integer token units and integer division. If the asset token
+//! has zero decimals, it cannot represent fractional holdings, and a small
+//! proportional payment may round down to zero and be unclaimable.
+//!
+//! # Claim deadline & reclaim policy (issue #2)
+//!
+//! A distribution may optionally carry a `deadline` (a ledger sequence number).
+//! This is a **policy decision**, documented here before the implementation
+//! below:
+//!
+//! 1. `deadline == 0` means "no deadline" — the distribution behaves exactly
+//!    as before and can be claimed at any time; funds are never reclaimable.
+//! 2. When `deadline != 0`, holders may claim normally up to and including
+//!    ledger `deadline`. Once `env.ledger().sequence() > deadline`, `claim`
+//!    is rejected with `DeadlinePassed` — holders permanently lose the
+//!    ability to claim after the deadline.
+//! 3. Once the deadline has passed, the contract **admin** — and only the
+//!    admin, not the original issuer or any other role — may call
+//!    `reclaim_unclaimed` to sweep whatever remains unclaimed
+//!    (`total_amount - distributed`) out of escrow to themselves. This
+//!    exists so an issuer-controlled admin can recover dust/unclaimed funds
+//!    rather than have them locked in the contract forever; it is
+//!    intentionally restricted to admin because the admin is the only party
+//!    that funded the escrow in the first place.
+//! 4. Reclaiming marks the distribution `completed` and clears its snapshot,
+//!    exactly like a distribution that was fully claimed. Reclaim before the
+//!    deadline, or by a non-admin, is rejected.
 
 #[cfg(test)]
 extern crate std;
@@ -42,12 +70,19 @@ pub struct Distribution {
     pub distributed: i128,
     pub created_at: u32,
     pub completed: bool,
+    /// Ledger sequence after which claims are rejected and the admin may
+    /// reclaim unclaimed funds (issue #2). `0` means no deadline.
+    pub deadline: u32,
 }
 
 #[contracttype]
 #[derive(Clone)]
 enum DataKey {
     Admin,
+    /// Address nominated by the current admin via `propose_admin`, pending
+    /// acceptance via `accept_admin` (issue #4). Absent when there is no
+    /// proposal in flight.
+    PendingAdmin,
     Counter,
     Ids,
     Dist(u64),
@@ -87,6 +122,16 @@ pub enum Error {
     /// duplicate would inflate the denominator while its amount stays
     /// unclaimable — permanently stranding that slice of the escrow.
     DuplicateHolder = 11,
+    /// `accept_admin` or `cancel_admin_proposal` called with no pending
+    /// admin proposal on file (issue #4).
+    NoPendingAdmin = 12,
+    /// A claim was attempted after the distribution's `deadline` (issue #2).
+    DeadlinePassed = 13,
+    /// `reclaim_unclaimed` was called before the deadline (issue #2).
+    DeadlineNotReached = 14,
+    /// `reclaim_unclaimed` was called on a distribution with no deadline set
+    /// (`deadline == 0`), i.e. one whose policy never permits reclaiming.
+    NoDeadline = 15,
 }
 
 const DAY_IN_LEDGERS: u32 = 17_280;
@@ -147,8 +192,36 @@ impl DividendContract {
         total_amount: i128,
         eligible: Vec<(Address, i128)>,
     ) -> u64 {
+        Self::create_distribution_deadline(
+            env,
+            admin,
+            asset_token,
+            payment_token,
+            total_amount,
+            eligible,
+            0,
+        )
+    }
+
+    /// Same as `create_distribution`, but sets a claim `deadline` (a ledger
+    /// sequence number). See the module-level "Claim deadline & reclaim
+    /// policy" doc for the rules a non-zero deadline enables (issue #2).
+    /// `deadline == 0` is equivalent to `create_distribution` (no deadline).
+    pub fn create_distribution_deadline(
+        env: Env,
+        admin: Address,
+        asset_token: Address,
+        payment_token: Address,
+        total_amount: i128,
+        eligible: Vec<(Address, i128)>,
+        deadline: u32,
+    ) -> u64 {
         Self::require_admin(&env, &admin);
         if total_amount <= 0 {
+            panic_err(&env, Error::InvalidAmount);
+        }
+        // Reject distributions with empty eligible set (issue #365).
+        if eligible.len() == 0 {
             panic_err(&env, Error::InvalidAmount);
         }
         // Reject distributions where no holder can ever claim (issue #49).
@@ -213,6 +286,7 @@ impl DividendContract {
             distributed: 0,
             created_at: env.ledger().sequence(),
             completed: false,
+            deadline,
         };
         env.storage().persistent().set(&DataKey::Dist(id), &dist);
         env.storage().persistent().extend_ttl(
@@ -245,6 +319,37 @@ impl DividendContract {
 
     /// Amount a holder can still claim from a distribution (0 if already
     /// claimed, holds nothing, or the distribution is empty).
+    ///
+    /// # Rounding behaviour & dust (issue #4)
+    ///
+    /// Each claim is `floor(total_amount * balance_i / supply)`: integer
+    /// division truncates toward zero, so a holder's actual payout can be up
+    /// to (but never more than) `1` unit of `payment_token` less than their
+    /// exact proportional share. Because every holder's share is computed
+    /// independently, these per-holder rounding losses do **not** cancel out
+    /// — they only ever accumulate.
+    ///
+    /// **Worst-case dust, quantified:** let `N` be the number of entries in
+    /// the `eligible` snapshot. Writing each exact share as
+    /// `a_i = total_amount * balance_i / supply` (a real number), we have
+    /// `sum(a_i) = total_amount` exactly (since `sum(balance_i) = supply`).
+    /// The permanently-unclaimable dust is `total_amount - sum(floor(a_i))
+    /// = sum(frac(a_i))`, a sum of `N` fractional terms each in `[0, 1)`.
+    /// That sum is therefore strictly less than `N` and, being an integer
+    /// (both `total_amount` and the floored sum are integers), satisfies
+    /// `0 <= dust <= N - 1`. In other words: **at most one unit of
+    /// `payment_token` per eligible holder can be left stranded in escrow**,
+    /// and this bound is tight (achievable when every holder's remainder is
+    /// `supply - 1`). This dust is never reclaimed by `claim`/`claimable`;
+    /// see `reclaim_unclaimed` (issue #2) for the only way an admin can
+    /// recover it, and once a deadline is set.
+    ///
+    /// This is documented, expected behaviour, not a bug: exact proportional
+    /// division is generally impossible over integers, and the alternative
+    /// (rounding some holders up) would let claims collectively exceed
+    /// `total_amount`, violating the escrow invariant enforced by
+    /// `OverDistributed`. See `test::test_uneven_distribution_leaves_dust` in
+    /// `test.rs` for a worked example.
     pub fn claimable(env: Env, distribution_id: u64, holder: Address) -> i128 {
         let dist = Self::load(&env, distribution_id);
         if Self::has_claimed(env.clone(), distribution_id, holder.clone()) {
@@ -258,7 +363,8 @@ impl DividendContract {
         if basis <= 0 {
             return 0;
         }
-        // Proportional share, floored by integer division. Guard the
+        // Proportional share, floored by integer division. For zero-decimal
+        // asset tokens this can make small claims equal to zero. Guard the
         // multiplication against i128 overflow (issue #165).
         dist.total_amount
             .checked_mul(basis)
@@ -267,9 +373,35 @@ impl DividendContract {
     }
 
     /// Claim a holder's proportional share, paid from escrow. Holder-authorized.
+    ///
+    /// # Double-claim guard (issue #1)
+    ///
+    /// Each `(distribution_id, holder)` pair may be claimed at most once. This
+    /// is enforced by the `DataKey::Claimed(distribution_id, holder)` flag:
+    /// `claim` checks the flag first and panics with `AlreadyClaimed (#7)` if
+    /// it is already set, then sets it to `true` **before** the outbound
+    /// token transfer. Setting the flag before the transfer (rather than
+    /// after) matters because Soroban aborts and rolls back all storage
+    /// writes if any step in the function traps — so even if the transfer
+    /// itself were to panic, there is no window where the flag is set but the
+    /// funds were not sent, nor a window where funds could be sent twice by
+    /// re-entering before the flag is persisted. Because the flag is keyed
+    /// per-holder, claims from different holders are fully independent: they
+    /// touch disjoint storage keys and interleaving them (in any order, or
+    /// concurrently across separate transactions) can never cause one
+    /// holder's claim to block or double-pay another's. See
+    /// `test::claim_twice_by_same_holder_fails` and
+    /// `test::interleaved_claims_by_different_holders_all_succeed` in
+    /// `test.rs` for the properties this guard is expected to uphold.
     pub fn claim(env: Env, distribution_id: u64, holder: Address) {
         holder.require_auth();
         let mut dist = Self::load(&env, distribution_id);
+        // Policy (issue #2): once past the deadline, claims are rejected —
+        // only `reclaim_unclaimed` (admin-only) may move funds after this
+        // point.
+        if dist.deadline != 0 && env.ledger().sequence() > dist.deadline {
+            panic_err(&env, Error::DeadlinePassed);
+        }
         if Self::has_claimed(env.clone(), distribution_id, holder.clone()) {
             panic_err(&env, Error::AlreadyClaimed);
         }
@@ -314,6 +446,81 @@ impl DividendContract {
         bump(&env);
         env.events()
             .publish((symbol_short!("claim"), holder), (distribution_id, amount));
+    }
+
+    /// Sweep whatever remains unclaimed (`total_amount - distributed`) out of
+    /// escrow to the admin, once a distribution's deadline has passed.
+    /// Admin-authorized only (issue #2 policy). Errors:
+    /// `NoDeadline (#15)` if the distribution has no deadline set;
+    /// `DeadlineNotReached (#14)` if called before the deadline;
+    /// `NothingToClaim (#6)` if everything was already claimed or reclaimed.
+    pub fn reclaim_unclaimed(env: Env, admin: Address, distribution_id: u64) -> i128 {
+        Self::require_admin(&env, &admin);
+        let mut dist = Self::load(&env, distribution_id);
+        if dist.deadline == 0 {
+            panic_err(&env, Error::NoDeadline);
+        }
+        if env.ledger().sequence() <= dist.deadline {
+            panic_err(&env, Error::DeadlineNotReached);
+        }
+        let remaining = dist.total_amount - dist.distributed;
+        if remaining <= 0 {
+            panic_err(&env, Error::NothingToClaim);
+        }
+
+        let this = env.current_contract_address();
+        TokenClient::new(&env, &dist.payment_token).transfer(&this, &admin, &remaining);
+
+        dist.distributed = dist.total_amount;
+        dist.completed = true;
+        env.storage()
+            .persistent()
+            .remove(&DataKey::Snapshot(distribution_id));
+        env.storage()
+            .persistent()
+            .remove(&DataKey::Supply(distribution_id));
+        env.storage()
+            .persistent()
+            .set(&DataKey::Dist(distribution_id), &dist);
+        env.storage().persistent().extend_ttl(
+            &DataKey::Dist(distribution_id),
+            INSTANCE_LIFETIME_THRESHOLD,
+            INSTANCE_BUMP_AMOUNT,
+        );
+        bump(&env);
+        env.events().publish(
+            (symbol_short!("reclaim"), admin),
+            (distribution_id, remaining),
+        );
+        remaining
+    }
+
+    /// Cancel a distribution and return escrowed funds to the issuer.
+    /// Only works while nothing has been claimed (distributed == 0). Admin only.
+    pub fn cancel_distribution(env: Env, admin: Address, distribution_id: u64) {
+        Self::require_admin(&env, &admin);
+        let dist = Self::load(&env, distribution_id);
+        // Only allow cancellation before any claim is made (issue #366).
+        if dist.distributed > 0 {
+            panic_err(&env, Error::InvalidAmount);
+        }
+        // Return escrowed funds to the issuer.
+        let this = env.current_contract_address();
+        TokenClient::new(&env, &dist.payment_token).transfer(&this, &admin, &dist.total_amount);
+        // Mark as completed so no further claims are possible.
+        let mut cancelled_dist = dist;
+        cancelled_dist.completed = true;
+        env.storage()
+            .persistent()
+            .set(&DataKey::Dist(distribution_id), &cancelled_dist);
+        env.storage().persistent().extend_ttl(
+            &DataKey::Dist(distribution_id),
+            INSTANCE_LIFETIME_THRESHOLD,
+            INSTANCE_BUMP_AMOUNT,
+        );
+        bump(&env);
+        env.events()
+            .publish((symbol_short!("cancel"), admin), distribution_id);
     }
 
     /// Fetch a distribution by id.
@@ -390,6 +597,68 @@ impl DividendContract {
             .instance()
             .get(&DataKey::Admin)
             .unwrap_or_else(|| panic_err(&env, Error::NotInitialized))
+    }
+
+    /// Propose a new admin. Requires authorization from the current admin.
+    /// The role does not move yet — `new_admin` must call `accept_admin`
+    /// before the handover takes effect (issue #4). This makes a mistyped
+    /// `new_admin` harmless (it can simply be re-proposed or cancelled)
+    /// instead of a single-step transfer that would permanently brick
+    /// administration.
+    pub fn propose_admin(env: Env, admin: Address, new_admin: Address) {
+        Self::require_admin(&env, &admin);
+        env.storage()
+            .instance()
+            .set(&DataKey::PendingAdmin, &new_admin);
+        bump(&env);
+        env.events()
+            .publish((symbol_short!("proposed"), admin), new_admin);
+    }
+
+    /// Cancel a pending admin proposal. Requires authorization from the
+    /// current admin. Panics with `NoPendingAdmin` if there is nothing to
+    /// cancel.
+    pub fn cancel_admin_proposal(env: Env, admin: Address) {
+        Self::require_admin(&env, &admin);
+        if !env.storage().instance().has(&DataKey::PendingAdmin) {
+            panic_err(&env, Error::NoPendingAdmin);
+        }
+        env.storage().instance().remove(&DataKey::PendingAdmin);
+        bump(&env);
+        env.events()
+            .publish((symbol_short!("cancelled"), admin), ());
+    }
+
+    /// Accept a pending admin proposal, completing the handover. Must be
+    /// called by the proposed successor (issue #4); the role only ever moves
+    /// here, never in `propose_admin`. Emits `set_admin` carrying both the
+    /// previous and new admin so off-chain indexers can observe this
+    /// security-critical transition (issue #2).
+    pub fn accept_admin(env: Env, new_admin: Address) {
+        new_admin.require_auth();
+        let pending: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::PendingAdmin)
+            .unwrap_or_else(|| panic_err(&env, Error::NoPendingAdmin));
+        if pending != new_admin {
+            panic_err(&env, Error::Unauthorized);
+        }
+        let old_admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .unwrap_or_else(|| panic_err(&env, Error::NotInitialized));
+        env.storage().instance().set(&DataKey::Admin, &new_admin);
+        env.storage().instance().remove(&DataKey::PendingAdmin);
+        bump(&env);
+        env.events()
+            .publish((symbol_short!("set_admin"), old_admin), new_admin);
+    }
+
+    /// The address currently proposed as the next admin, if any.
+    pub fn get_pending_admin(env: Env) -> Option<Address> {
+        env.storage().instance().get(&DataKey::PendingAdmin)
     }
 
     // ---- internal helpers ----

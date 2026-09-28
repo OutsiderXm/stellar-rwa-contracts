@@ -34,6 +34,10 @@ pub struct AssetEntry {
 #[derive(Clone)]
 enum DataKey {
     Admin,
+    /// Address nominated by the current admin via `propose_admin`, pending
+    /// acceptance via `accept_admin` (issue #4). Absent when there is no
+    /// proposal in flight.
+    PendingAdmin,
     Counter,
     Ids,
     Asset(u64),
@@ -58,8 +62,11 @@ pub enum Error {
     InvalidValuation = 5,
     Overflow = 6,
     InvalidInput = 7,
+    /// `accept_admin` or `cancel_admin_proposal` called with no pending
+    /// admin proposal on file (issue #4).
+    NoPendingAdmin = 8,
     /// A token contract is already registered under a different asset id.
-    DuplicateAsset = 8,
+    DuplicateAsset = 9,
 }
 
 const DAY_IN_LEDGERS: u32 = 17_280;
@@ -103,6 +110,13 @@ impl RegistryContract {
     }
 
     /// Register a new tokenized asset. The issuer must authorize the call.
+    ///
+    /// `valuation` is copied into the registry entry and TVL at registration
+    /// time. It is independent from any valuation stored by the token
+    /// contract: the registry has no callback or synchronization hook when a
+    /// token updates its metadata valuation. Divergence is therefore possible
+    /// and callers must verify both records; the current registry API has no
+    /// valuation-update entrypoint.
     /// Returns the assigned asset id.
     pub fn register_asset(
         env: Env,
@@ -238,6 +252,14 @@ impl RegistryContract {
     /// whole registry.
     /// Note: This includes both active and deactivated assets. Deactivated assets
     /// are never removed from the index; use the `active` field to filter if needed.
+    ///
+    /// Matching is **byte-exact**: the index key is the `asset_type` string as
+    /// stored on the entry at registration time, so lookups are case-sensitive
+    /// and whitespace-sensitive. `"real_estate"`, `"Real_Estate"` and
+    /// `"real_estate "` are three distinct index keys; since only the values
+    /// in `VALID_ASSET_TYPES` can ever be registered (see
+    /// `validate_asset_type`), a query must match one of those canonical
+    /// strings exactly to return any results.
     pub fn get_assets_by_type(env: Env, asset_type: String) -> Vec<AssetEntry> {
         let ids = Self::index_ids(&env, &DataKey::TypeIndex(asset_type));
         Self::fetch_assets(&env, &ids)
@@ -321,6 +343,107 @@ impl RegistryContract {
             .publish((symbol_short!("deactvate"),), asset_id);
     }
 
+    /// Update an asset's valuation. Admin only. Adjusts total value locked
+    /// accordingly (only while the asset is `active`) and emits a
+    /// `valuation` event carrying the asset id and both the old and new
+    /// valuations, so indexers can observe the change without polling
+    /// (issue #3).
+    pub fn update_valuation(env: Env, admin: Address, asset_id: u64, new_valuation: i128) {
+        Self::require_admin(&env, &admin);
+        if new_valuation < 0 {
+            panic_err(&env, Error::InvalidValuation);
+        }
+        let mut entry: AssetEntry = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Asset(asset_id))
+            .unwrap_or_else(|| panic_err(&env, Error::AssetNotFound));
+        let old_valuation = entry.valuation;
+        entry.valuation = new_valuation;
+        env.storage()
+            .persistent()
+            .set(&DataKey::Asset(asset_id), &entry);
+        env.storage().persistent().extend_ttl(
+            &DataKey::Asset(asset_id),
+            INSTANCE_LIFETIME_THRESHOLD,
+            INSTANCE_BUMP_AMOUNT,
+        );
+
+        if entry.active {
+            let tvl: i128 = env
+                .storage()
+                .instance()
+                .get(&DataKey::TotalValuation)
+                .unwrap_or(0);
+            let new_tvl = tvl
+                .checked_sub(old_valuation)
+                .and_then(|v| v.checked_add(new_valuation))
+                .unwrap_or_else(|| panic_err(&env, Error::Overflow));
+            env.storage()
+                .instance()
+                .set(&DataKey::TotalValuation, &new_tvl);
+        }
+
+        bump(&env);
+        env.events().publish(
+            (symbol_short!("valuation"), asset_id),
+            (old_valuation, new_valuation),
+        );
+    }
+
+    /// Reactivate a previously deactivated asset. Admin only. Included in TVL
+    /// and `active_count` again afterwards. Does nothing if the asset is
+    /// already active (no event emitted).
+    ///
+    /// Deactivation is not treated as final: assets are sometimes deactivated
+    /// by mistake (wrong id, premature admin action), and re-registering under
+    /// a new id would break existing references to the original one (issuer
+    /// index, type index, external links). Reactivation restores the same
+    /// entry in place instead.
+    pub fn reactivate_asset(env: Env, admin: Address, asset_id: u64) {
+        Self::require_admin(&env, &admin);
+        let mut entry: AssetEntry = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Asset(asset_id))
+            .unwrap_or_else(|| panic_err(&env, Error::AssetNotFound));
+        if entry.active {
+            return;
+        }
+        entry.active = true;
+        env.storage()
+            .persistent()
+            .set(&DataKey::Asset(asset_id), &entry);
+        env.storage().persistent().extend_ttl(
+            &DataKey::Asset(asset_id),
+            INSTANCE_LIFETIME_THRESHOLD,
+            INSTANCE_BUMP_AMOUNT,
+        );
+        let active_count: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::ActiveCount)
+            .unwrap_or(0u64)
+            + 1;
+        env.storage()
+            .instance()
+            .set(&DataKey::ActiveCount, &active_count);
+        let tvl: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::TotalValuation)
+            .unwrap_or(0);
+        let new_tvl = tvl
+            .checked_add(entry.valuation)
+            .unwrap_or_else(|| panic_err(&env, Error::Overflow));
+        env.storage()
+            .instance()
+            .set(&DataKey::TotalValuation, &new_tvl);
+        bump(&env);
+        env.events()
+            .publish((symbol_short!("reactvate"),), asset_id);
+    }
+
     /// Sum of valuations across all active assets, in USD cents. Maintained
     /// incrementally on register/deactivate, so this is a single read
     /// regardless of registry size.
@@ -350,6 +473,68 @@ impl RegistryContract {
             .instance()
             .get(&DataKey::Admin)
             .unwrap_or_else(|| panic_err(&env, Error::NotInitialized))
+    }
+
+    /// Propose a new admin. Requires authorization from the current admin.
+    /// The role does not move yet — `new_admin` must call `accept_admin`
+    /// before the handover takes effect (issue #4). This makes a mistyped
+    /// `new_admin` harmless (it can simply be re-proposed or cancelled)
+    /// instead of a single-step transfer that would permanently brick
+    /// administration.
+    pub fn propose_admin(env: Env, admin: Address, new_admin: Address) {
+        Self::require_admin(&env, &admin);
+        env.storage()
+            .instance()
+            .set(&DataKey::PendingAdmin, &new_admin);
+        bump(&env);
+        env.events()
+            .publish((symbol_short!("proposed"), admin), new_admin);
+    }
+
+    /// Cancel a pending admin proposal. Requires authorization from the
+    /// current admin. Panics with `NoPendingAdmin` if there is nothing to
+    /// cancel.
+    pub fn cancel_admin_proposal(env: Env, admin: Address) {
+        Self::require_admin(&env, &admin);
+        if !env.storage().instance().has(&DataKey::PendingAdmin) {
+            panic_err(&env, Error::NoPendingAdmin);
+        }
+        env.storage().instance().remove(&DataKey::PendingAdmin);
+        bump(&env);
+        env.events()
+            .publish((symbol_short!("cancelled"), admin), ());
+    }
+
+    /// Accept a pending admin proposal, completing the handover. Must be
+    /// called by the proposed successor (issue #4); the role only ever moves
+    /// here, never in `propose_admin`. Emits `set_admin` carrying both the
+    /// previous and new admin so off-chain indexers can observe this
+    /// security-critical transition (issue #2).
+    pub fn accept_admin(env: Env, new_admin: Address) {
+        new_admin.require_auth();
+        let pending: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::PendingAdmin)
+            .unwrap_or_else(|| panic_err(&env, Error::NoPendingAdmin));
+        if pending != new_admin {
+            panic_err(&env, Error::Unauthorized);
+        }
+        let old_admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .unwrap_or_else(|| panic_err(&env, Error::NotInitialized));
+        env.storage().instance().set(&DataKey::Admin, &new_admin);
+        env.storage().instance().remove(&DataKey::PendingAdmin);
+        bump(&env);
+        env.events()
+            .publish((symbol_short!("set_admin"), old_admin), new_admin);
+    }
+
+    /// The address currently proposed as the next admin, if any.
+    pub fn get_pending_admin(env: Env) -> Option<Address> {
+        env.storage().instance().get(&DataKey::PendingAdmin)
     }
 
     // ---- internal helpers ----

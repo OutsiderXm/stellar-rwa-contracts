@@ -3,7 +3,7 @@ use super::*;
 use compliance::{ComplianceContract, ComplianceContractClient};
 use proptest::prelude::*;
 use soroban_sdk::{
-    testutils::{Address as _, AuthorizedFunction, Events},
+    testutils::{Address as _, AuthorizedFunction, Events, Ledger},
     Address, Env, String, Symbol, Vec,
 };
 
@@ -366,8 +366,84 @@ fn test_mint_succeeds_after_unpause() {
 }
 
 #[test]
+fn test_guardian_absent_by_default() {
+    let s = setup(1_000);
+    assert_eq!(s.token.get_metadata().guardian, None);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #3)")]
+fn test_pause_by_stranger_reverts() {
+    let s = setup(1_000);
+    let stranger = Address::generate(&s.env);
+    s.token.pause(&stranger);
+}
+
+#[test]
+fn test_guardian_can_pause() {
+    let s = setup(1_000);
+    let guardian = Address::generate(&s.env);
+    s.token.set_guardian(&s.admin, &Some(guardian.clone()));
+    assert_eq!(s.token.get_metadata().guardian, Some(guardian.clone()));
+    s.token.pause(&guardian);
+    assert!(s.token.get_metadata().paused);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #3)")]
+fn test_guardian_cannot_unpause() {
+    let s = setup(1_000);
+    let guardian = Address::generate(&s.env);
+    s.token.set_guardian(&s.admin, &Some(guardian.clone()));
+    s.token.pause(&guardian);
+    s.token.unpause(&guardian);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #3)")]
+fn test_guardian_cannot_mint() {
+    let s = setup(1_000);
+    let guardian = Address::generate(&s.env);
+    let bob = Address::generate(&s.env);
+    approve(&s.env, &s.compliance, &s.admin, &bob);
+    s.token.set_guardian(&s.admin, &Some(guardian.clone()));
+    s.token.mint(&guardian, &bob, &100);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #3)")]
+fn test_set_guardian_by_non_admin_reverts() {
+    let s = setup(1_000);
+    let impostor = Address::generate(&s.env);
+    let guardian = Address::generate(&s.env);
+    s.token.set_guardian(&impostor, &Some(guardian));
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #3)")]
+fn test_cleared_guardian_loses_pause_rights() {
+    let s = setup(1_000);
+    let guardian = Address::generate(&s.env);
+    s.token.set_guardian(&s.admin, &Some(guardian.clone()));
+    s.token.set_guardian(&s.admin, &None);
+    assert_eq!(s.token.get_metadata().guardian, None);
+    s.token.pause(&guardian);
+}
+
+#[test]
+fn test_admin_still_pauses_with_guardian_set() {
+    let s = setup(1_000);
+    let guardian = Address::generate(&s.env);
+    s.token.set_guardian(&s.admin, &Some(guardian));
+    s.token.pause(&s.admin);
+    assert!(s.token.get_metadata().paused);
+}
+
+#[test]
 fn test_update_valuation() {
     let s = setup(1_000);
+    // Valuation is local token metadata; a separately registered valuation is
+    // not synchronized by this call.
     s.token.update_valuation(&s.admin, &75_000_000);
     assert_eq!(s.token.get_metadata().valuation, 75_000_000);
 }
@@ -448,6 +524,21 @@ fn test_burn_blocked_when_holder_not_compliant() {
     s.token.transfer(&s.admin, &bob, &200);
     // Bob now holds tokens; revoke his approval.
     s.compliance.remove(&s.admin, &bob);
+    s.token.burn(&bob, &100);
+}
+
+/// Pins the deliberate policy documented on `AssetTokenContract::burn`: a
+/// holder who is *suspended* (as opposed to fully removed) is still
+/// compliance-gated and may not burn their tokens.
+#[test]
+#[should_panic(expected = "Error(Contract, #7)")]
+fn test_burn_blocked_when_holder_suspended() {
+    let s = setup(1_000);
+    let bob = Address::generate(&s.env);
+    approve(&s.env, &s.compliance, &s.admin, &bob);
+    s.token.transfer(&s.admin, &bob, &200);
+    // Bob holds tokens; suspend (not remove) his approval.
+    s.compliance.suspend(&s.admin, &bob);
     s.token.burn(&bob, &100);
 }
 
@@ -803,7 +894,384 @@ fn test_total_supply_tracks_mint_burn_mint_batch() {
     assert_eq!(s.token.get_metadata().total_supply, s.token.total_supply());
 }
 
-// ---- issue #305: compliance gate against an address that cannot satisfy the call ----
+// ---- issue #3: compliance admin and asset-token admin may diverge ----
+
+/// `scripts/deploy.sh` initializes both contracts with the same address as a
+/// convenience default, but nothing in either contract ties the two admins
+/// together. This proves a real deployment can use two distinct addresses —
+/// a dedicated compliance officer and a separate asset-token admin — with
+/// each administering only their own contract.
+#[test]
+fn test_compliance_admin_diverges_from_asset_admin() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let asset_admin = Address::generate(&env);
+    let compliance_officer = Address::generate(&env);
+    assert_ne!(asset_admin, compliance_officer);
+
+    let compliance_id = env.register(ComplianceContract, ());
+    let compliance = ComplianceContractClient::new(&env, &compliance_id);
+    compliance.initialize(&compliance_officer);
+
+    // The compliance officer — not the asset admin — approves the asset
+    // admin to hold the initial supply.
+    approve(&env, &compliance, &compliance_officer, &asset_admin);
+
+    let token_id = env.register(AssetTokenContract, ());
+    let token = AssetTokenContractClient::new(&env, &token_id);
+    token.initialize(
+        &asset_admin,
+        &String::from_str(&env, "Manhattan Loft"),
+        &String::from_str(&env, "MLOFT"),
+        &String::from_str(&env, "real_estate"),
+        &1_000i128,
+        &2u32,
+        &compliance_id,
+        &String::from_str(&env, "A tokenized NYC loft"),
+        &50_000_000i128,
+    );
+
+    // The two admins are recorded independently and are not equal.
+    assert_eq!(token.get_metadata().admin, asset_admin);
+    assert_eq!(compliance.get_admin(), compliance_officer);
+
+    // The compliance officer administers KYC entirely on their own: approve,
+    // suspend, and block a jurisdiction, none of which involves asset_admin.
+    let bob = Address::generate(&env);
+    approve(&env, &compliance, &compliance_officer, &bob);
+    token.transfer(&asset_admin, &bob, &100);
+    assert_eq!(token.balance(&bob), 100);
+
+    compliance.suspend(&compliance_officer, &bob);
+    let res = token.try_transfer(&bob, &asset_admin, &10);
+    assert_eq!(res, Err(Ok(Error::SenderNotCompliant.into())));
+
+    // The asset admin independently retains full control of the token (mint
+    // still requires only asset_admin, never the compliance officer).
+    let carol = Address::generate(&env);
+    approve(&env, &compliance, &compliance_officer, &carol);
+    token.mint(&asset_admin, &carol, &50);
+    assert_eq!(token.balance(&carol), 50);
+
+    // Neither admin has authority over the other's contract.
+    let dave = Address::generate(&env);
+    let res = compliance.try_add_to_allowlist(
+        &asset_admin,
+        &dave,
+        &String::from_str(&env, "US"),
+        &0,
+    );
+    assert_eq!(res, Err(Ok(compliance::Error::Unauthorized.into())));
+
+    let res = token.try_mint(&compliance_officer, &carol, &10);
+    assert_eq!(res, Err(Ok(Error::Unauthorized.into())));
+}
+
+// ---- admin handover (issue #4) ----
+
+#[test]
+fn test_propose_accept_admin_moves_role_only_on_acceptance() {
+    let s = setup(1_000);
+    let successor = Address::generate(&s.env);
+    approve(&s.env, &s.compliance, &s.admin, &successor);
+
+    s.token.propose_admin(&s.admin, &successor);
+    // Role must not move until accepted.
+    assert_eq!(s.token.get_metadata().admin, s.admin);
+    assert_eq!(s.token.get_pending_admin(), Some(successor.clone()));
+
+    s.token.accept_admin(&successor);
+    assert_eq!(s.token.get_metadata().admin, successor);
+    assert_eq!(s.token.get_pending_admin(), None);
+
+    // The old admin has lost its privileges.
+    let res = s.token.try_mint(&s.admin, &successor, &10);
+    assert_eq!(res, Err(Ok(Error::Unauthorized.into())));
+    // The new admin can act.
+    s.token.mint(&successor, &successor, &10);
+}
+
+#[test]
+fn test_cancel_admin_proposal_by_current_admin() {
+    let s = setup(1_000);
+    let successor = Address::generate(&s.env);
+
+    s.token.propose_admin(&s.admin, &successor);
+    s.token.cancel_admin_proposal(&s.admin);
+    assert_eq!(s.token.get_pending_admin(), None);
+
+    // The cancelled successor can no longer accept.
+    let res = s.token.try_accept_admin(&successor);
+    assert_eq!(res, Err(Ok(Error::NoPendingAdmin.into())));
+    // The admin is unchanged.
+    assert_eq!(s.token.get_metadata().admin, s.admin);
+}
+
+#[test]
+fn test_cancel_admin_proposal_with_nothing_pending_fails() {
+    let s = setup(1_000);
+    let res = s.token.try_cancel_admin_proposal(&s.admin);
+    assert_eq!(res, Err(Ok(Error::NoPendingAdmin.into())));
+}
+
+#[test]
+fn test_non_admin_cannot_propose_admin() {
+    let s = setup(1_000);
+    let non_admin = Address::generate(&s.env);
+    let successor = Address::generate(&s.env);
+    let res = s.token.try_propose_admin(&non_admin, &successor);
+    assert_eq!(res, Err(Ok(Error::Unauthorized.into())));
+}
+
+#[test]
+fn test_non_admin_cannot_cancel_admin_proposal() {
+    let s = setup(1_000);
+    let non_admin = Address::generate(&s.env);
+    let successor = Address::generate(&s.env);
+    s.token.propose_admin(&s.admin, &successor);
+    let res = s.token.try_cancel_admin_proposal(&non_admin);
+    assert_eq!(res, Err(Ok(Error::Unauthorized.into())));
+}
+
+#[test]
+fn test_only_proposed_successor_can_accept() {
+    let s = setup(1_000);
+    let successor = Address::generate(&s.env);
+    let impostor = Address::generate(&s.env);
+
+    s.token.propose_admin(&s.admin, &successor);
+    let res = s.token.try_accept_admin(&impostor);
+    assert_eq!(res, Err(Ok(Error::Unauthorized.into())));
+    // Role is unaffected by the failed attempt.
+    assert_eq!(s.token.get_metadata().admin, s.admin);
+}
+
+#[test]
+fn test_accept_admin_with_no_pending_proposal_fails() {
+    let s = setup(1_000);
+    let stranger = Address::generate(&s.env);
+    let res = s.token.try_accept_admin(&stranger);
+    assert_eq!(res, Err(Ok(Error::NoPendingAdmin.into())));
+}
+
+#[test]
+fn test_admin_handover_does_not_affect_guardian() {
+    // Issue #4: propose/accept must be independent of the guardian (issue #1).
+    let s = setup(1_000);
+    let guardian = Address::generate(&s.env);
+    let successor = Address::generate(&s.env);
+    approve(&s.env, &s.compliance, &s.admin, &successor);
+
+    s.token.set_guardian(&s.admin, &Some(guardian.clone()));
+    s.token.propose_admin(&s.admin, &successor);
+    s.token.accept_admin(&successor);
+
+    assert_eq!(s.token.get_metadata().admin, successor);
+    assert_eq!(s.token.get_metadata().guardian, Some(guardian));
+}
+
+// Issue #370: Test that token metadata survives a TTL boundary.
+#[test]
+fn test_metadata_survives_ttl_boundary() {
+    let s = setup(1_000);
+
+    // Verify metadata is readable
+    let metadata = s.token.get_metadata();
+    assert_eq!(metadata.name, String::from_str(&s.env, "Manhattan Loft"));
+    assert_eq!(metadata.symbol, String::from_str(&s.env, "MLOFT"));
+
+    // Advance ledger past TTL threshold
+    s.env.ledger().set_sequence_number(500_000);
+
+    // Verify metadata still exists after ledger advance
+    let metadata_after = s.token.get_metadata();
+    assert_eq!(
+        metadata_after.name, metadata.name,
+        "Metadata must survive TTL boundary"
+    );
+    assert_eq!(metadata_after.symbol, metadata.symbol);
+}
+
+// Issue #371: Test that account balances survive a TTL boundary.
+#[test]
+fn test_balances_survive_ttl_boundary() {
+    let s = setup(1_000);
+    let user = Address::generate(&s.env);
+    approve(&s.env, &s.compliance, &s.admin, &user);
+
+    // Initial state: admin has 1000, user has 0
+    assert_eq!(s.token.balance(&s.admin), 1_000);
+    assert_eq!(s.token.balance(&user), 0);
+
+    // Transfer some tokens
+    s.token.transfer(&s.admin, &user, &300);
+    assert_eq!(s.token.balance(&s.admin), 700);
+    assert_eq!(s.token.balance(&user), 300);
+
+    // Advance ledger past TTL threshold
+    s.env.ledger().set_sequence_number(500_000);
+
+    // Verify balances still exist after ledger advance
+    assert_eq!(
+        s.token.balance(&s.admin),
+        700,
+        "Admin balance must survive TTL boundary"
+    );
+    assert_eq!(
+        s.token.balance(&user),
+        300,
+        "User balance must survive TTL boundary"
+    );
+}
+
+// ---- extreme `decimals` documentation test ----
+//
+// `initialize` accepts any `u32` for `decimals` with no upper-bound
+// validation. `decimals` is stored as opaque metadata by this contract and is
+// never used in on-chain arithmetic here (balances/`total_supply` are raw
+// `i128` units, independent of `decimals`), so a huge `decimals` value does
+// not by itself overflow anything inside asset-token. The risk is entirely
+// downstream: a consumer (e.g. a UI, or another contract computing
+// `total_amount * basis` scaled by `10^decimals`, as `dividend` effectively
+// does when interpreting amounts) that treats `decimals` as bounded (e.g.
+// `<= 18`, matching typical token conventions) could overflow or produce
+// nonsensical results. This test documents *current* behavior: `initialize`
+// happily accepts `decimals = 255` (u8::MAX, an extreme but valid `u32`)
+// alongside a large `total_supply` and `valuation`, and all reads
+// (`get_metadata`, `total_supply`, `balance`) remain internally consistent.
+// If an upper bound is added later (closing this gap), this test's
+// expectations should change from "accepted" to "rejected".
+#[test]
+fn test_extreme_decimals_accepted_with_large_supply_and_valuation() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let compliance_id = env.register(ComplianceContract, ());
+    let compliance = ComplianceContractClient::new(&env, &compliance_id);
+    let admin = Address::generate(&env);
+    compliance.initialize(&admin);
+    approve(&env, &compliance, &admin, &admin);
+
+    let token_id = env.register(AssetTokenContract, ());
+    let token = AssetTokenContractClient::new(&env, &token_id);
+
+    // A supply and valuation near the top of what `i128` can represent,
+    // combined with an extreme decimals value, to probe for overflow or
+    // inconsistent reads in asset-token's own storage/arithmetic.
+    let huge_supply: i128 = 170_141_183_460_469_231_731_687_303_715_884_105_727 / 2;
+    let huge_valuation: i128 = huge_supply;
+    let extreme_decimals: u32 = 255;
+
+    token.initialize(
+        &admin,
+        &String::from_str(&env, "Extreme Decimals Asset"),
+        &String::from_str(&env, "XTRM"),
+        &String::from_str(&env, "real_estate"),
+        &huge_supply,
+        &extreme_decimals,
+        &compliance_id,
+        &String::from_str(&env, "Documents current no-upper-bound decimals behavior"),
+        &huge_valuation,
+    );
+
+    // `initialize` did not panic or clamp `decimals`; it is stored verbatim.
+    let meta = token.get_metadata();
+    assert_eq!(meta.decimals, extreme_decimals);
+    assert_eq!(meta.total_supply, huge_supply);
+    assert_eq!(meta.valuation, huge_valuation);
+
+    // Balance/supply bookkeeping stays internally consistent regardless of
+    // the (unrelated, unused-in-arithmetic) decimals value.
+    assert_eq!(token.balance(&admin), huge_supply);
+    assert_eq!(token.total_supply(), huge_supply);
+
+    // A subsequent mint still behaves normally: `decimals` plays no role in
+    // asset-token's own overflow checks, only in how a downstream consumer
+    // might choose to scale/interpret raw i128 amounts.
+    let bob = Address::generate(&env);
+    approve(&env, &compliance, &admin, &bob);
+    token.mint(&admin, &bob, &1_000);
+    assert_eq!(token.balance(&bob), 1_000);
+    assert_eq!(token.total_supply(), huge_supply + 1_000);
+}
+
+// Issue #376: Property test for supply conservation
+proptest! {
+    #[test]
+    fn prop_supply_conserved_after_operations(
+        mint_amounts in prop::collection::vec(1i128..100_000i128, 0..5),
+        burn_amount in 0i128..1_000_000i128,
+    ) {
+        let s = setup(1_000_000);
+        let initial_supply = s.token.total_supply();
+
+        let bob = Address::generate(&s.env);
+        approve(&s.env, &s.compliance, &s.admin, &bob);
+
+        for amount in mint_amounts {
+            s.token.mint(&s.admin, &bob, &amount);
+        }
+
+        let supply_after_mints = s.token.total_supply();
+        let bob_balance = s.token.balance(&bob);
+
+        if burn_amount <= s.token.balance(&s.admin) {
+            s.token.burn(&s.admin, &burn_amount);
+        }
+
+        let final_supply = s.token.total_supply();
+
+        // Check: sum of all balances equals total supply
+        let admin_balance = s.token.balance(&s.admin);
+        let sum_of_balances = admin_balance.saturating_add(bob_balance);
+
+        prop_assert_eq!(
+            final_supply, sum_of_balances,
+            "Supply conservation violated: total={}, sum_of_balances={}",
+            final_supply, sum_of_balances
+        );
+    }
+}
+
+// Issue #375: Property test for compliance transfer gate
+proptest! {
+    #[test]
+    fn prop_transfer_gate_enforced(
+        sender_approved in prop::bool::ANY,
+        recipient_approved in prop::bool::ANY,
+    ) {
+        let s = setup(1_000);
+        let sender = Address::generate(&s.env);
+        let recipient = Address::generate(&s.env);
+
+        if sender_approved {
+            approve(&s.env, &s.compliance, &s.admin, &sender);
+        }
+        if recipient_approved {
+            approve(&s.env, &s.compliance, &s.admin, &recipient);
+        }
+
+        // Mint to sender
+        if sender_approved {
+            s.token.mint(&s.admin, &sender, &100);
+        }
+
+        // Transfer succeeds only if BOTH are approved
+        let should_succeed = sender_approved && recipient_approved;
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            s.token.transfer(&sender, &recipient, &50);
+        }));
+
+        if should_succeed {
+            prop_assert!(result.is_ok(), "Transfer should succeed when both approved");
+        } else {
+            prop_assert!(result.is_err(), "Transfer should fail when either party not approved");
+        }
+    }
+}
+
 
 /// If the configured compliance contract address holds no contract at all,
 /// the cross-contract call the gate depends on cannot execute and the host
@@ -836,21 +1304,18 @@ fn test_transfer_traps_when_compliance_contract_is_unreachable() {
     let ghost_compliance = Address::generate(&env);
     let token_id = env.register(AssetTokenContract, ());
     let token = AssetTokenContractClient::new(&env, &token_id);
-    // We cannot initialize through the ghost gate (initialize itself checks
-    // compliance), so this test asserts the trap occurs at the earliest
-    // possible point: initialization also depends on the same gate call.
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        token.initialize(
-            &admin,
-            &String::from_str(&env, "Ghost Asset"),
-            &String::from_str(&env, "GHOST"),
-            &String::from_str(&env, "real_estate"),
-            &1_000i128,
-            &2u32,
-            &ghost_compliance,
-            &String::from_str(&env, "no contract at this address"),
-            &1_000i128,
-        );
-    }));
-    assert!(result.is_err(), "expected a trap from the unreachable compliance contract");
+    // `initialize` itself consults the compliance gate (to check the admin), so
+    // pointing it at an address with no contract traps at the earliest possible
+    // point — the same `is_allowed` call path `transfer`/`mint` use.
+    token.initialize(
+        &admin,
+        &String::from_str(&env, "Ghost Asset"),
+        &String::from_str(&env, "GHOST"),
+        &String::from_str(&env, "real_estate"),
+        &1_000i128,
+        &2u32,
+        &ghost_compliance,
+        &String::from_str(&env, "no contract at this address"),
+        &1_000i128,
+    );
 }
