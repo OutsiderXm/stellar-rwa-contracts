@@ -447,6 +447,14 @@ impl RegistryContract {
     /// Sum of valuations across all active assets, in USD cents. Maintained
     /// incrementally on register/deactivate, so this is a single read
     /// regardless of registry size.
+    ///
+    /// This registry entry's `valuation` is a point-in-time snapshot taken at
+    /// `register_asset` and is not synced with the corresponding
+    /// asset-token contract's live valuation. The asset-token contract's
+    /// `update_valuation` bounds any single change to
+    /// `MAX_VALUATION_CHANGE_BPS` (50%) of the previous value precisely
+    /// because a runaway or mistyped valuation there would otherwise be able
+    /// to skew this TVL figure for every downstream client that reads it.
     pub fn total_value_locked(env: Env) -> i128 {
         env.storage()
             .instance()

@@ -69,6 +69,15 @@ pub struct AssetMetadata {
 enum DataKey {
     Metadata,
     Balance(Address),
+    Allowance(Address, Address),
+}
+
+/// SEP-41 allowance record: amount plus the ledger sequence it expires at.
+#[contracttype]
+#[derive(Clone)]
+pub struct AllowanceValue {
+    pub amount: i128,
+    pub expiration_ledger: u32,
 }
 
 #[contracterror]
@@ -86,6 +95,8 @@ pub enum Error {
     Overflow = 9,
     InvalidInput = 10,
     InvalidCompliance = 11,
+    InsufficientAllowance = 12,
+    ValuationChangeTooLarge = 13,
     /// `accept_admin` or `cancel_admin_proposal` called with no pending
     /// admin proposal on file (issue #4).
     NoPendingAdmin = 12,
@@ -100,6 +111,17 @@ const MAX_DESC_LEN: u32 = 256;
 const DAY_IN_LEDGERS: u32 = 17_280;
 const INSTANCE_BUMP_AMOUNT: u32 = 30 * DAY_IN_LEDGERS;
 const INSTANCE_LIFETIME_THRESHOLD: u32 = INSTANCE_BUMP_AMOUNT - DAY_IN_LEDGERS;
+
+/// `update_valuation` rejects any single change larger than this fraction of
+/// the previous valuation, expressed in basis points (5_000 = 50%). This
+/// guards against a mistyped USD-cent value propagating to the registry's
+/// total value locked. Chosen as a generous-but-bounded ceiling: legitimate
+/// re-appraisals rarely move a real-world asset's value by more than half in
+/// one update, while a fat-fingered extra digit (a 10x+ change) is reliably
+/// caught. A valuation of `0` is exempt since there is no prior magnitude to
+/// compare against.
+const MAX_VALUATION_CHANGE_BPS: i128 = 5_000;
+const BPS_DENOMINATOR: i128 = 10_000;
 
 /// Contract ABI/behavior version. Bump on any change to storage layout or
 /// externally observable behavior so clients and the indexer can detect it.
@@ -358,6 +380,105 @@ impl AssetTokenContract {
         env.events().publish((symbol_short!("burn"), from), amount);
     }
 
+    /// SEP-41: authorize `spender` to move up to `amount` of `from`'s tokens
+    /// until `expiration_ledger` (inclusive). Passing `amount == 0` clears the
+    /// allowance regardless of `expiration_ledger`. Divergence from the raw
+    /// spec: paused tokens reject `approve` the same as `transfer`, since an
+    /// approval is only meaningful if a matching `transfer_from` could later
+    /// succeed (documented in docs/asset-token.md).
+    pub fn approve(env: Env, from: Address, spender: Address, amount: i128, expiration_ledger: u32) {
+        from.require_auth();
+        if amount < 0 {
+            panic_err(&env, Error::InvalidAmount);
+        }
+        let meta = Self::metadata(&env);
+        if meta.paused {
+            panic_err(&env, Error::Paused);
+        }
+        if amount > 0 && expiration_ledger < env.ledger().sequence() {
+            panic_err(&env, Error::InvalidInput);
+        }
+        let key = DataKey::Allowance(from.clone(), spender.clone());
+        env.storage().temporary().set(
+            &key,
+            &AllowanceValue {
+                amount,
+                expiration_ledger,
+            },
+        );
+        if amount > 0 {
+            let live_for = expiration_ledger.saturating_sub(env.ledger().sequence());
+            env.storage().temporary().extend_ttl(&key, live_for, live_for);
+        }
+        env.events().publish(
+            (symbol_short!("approve"), from, spender),
+            (amount, expiration_ledger),
+        );
+    }
+
+    /// SEP-41: remaining amount `spender` may transfer from `from`. Returns 0
+    /// once `expiration_ledger` has passed, matching the spec's "expired
+    /// allowances read as zero" semantics rather than returning a stale value.
+    pub fn allowance(env: Env, from: Address, spender: Address) -> i128 {
+        let key = DataKey::Allowance(from, spender);
+        match env.storage().temporary().get::<_, AllowanceValue>(&key) {
+            Some(v) if v.expiration_ledger >= env.ledger().sequence() => v.amount,
+            _ => 0,
+        }
+    }
+
+    /// SEP-41: move `amount` from `from` to `to` using a prior `approve`.
+    /// Subject to the same pause/compliance gates as `transfer`.
+    pub fn transfer_from(env: Env, spender: Address, from: Address, to: Address, amount: i128) {
+        spender.require_auth();
+        Self::check_amount(&env, amount);
+        let meta = Self::metadata(&env);
+        if meta.paused {
+            panic_err(&env, Error::Paused);
+        }
+        if !Self::compliant(&env, &meta.compliance_contract, &from) {
+            panic_err(&env, Error::SenderNotCompliant);
+        }
+        if !Self::compliant(&env, &meta.compliance_contract, &to) {
+            panic_err(&env, Error::RecipientNotCompliant);
+        }
+        let key = DataKey::Allowance(from.clone(), spender.clone());
+        let current = env
+            .storage()
+            .temporary()
+            .get::<_, AllowanceValue>(&key)
+            .unwrap_or(AllowanceValue {
+                amount: 0,
+                expiration_ledger: 0,
+            });
+        if current.expiration_ledger < env.ledger().sequence() || current.amount < amount {
+            panic_err(&env, Error::InsufficientAllowance);
+        }
+        let from_bal = Self::balance(env.clone(), from.clone());
+        if from_bal < amount {
+            panic_err(&env, Error::InsufficientBalance);
+        }
+        let new_from_bal = from_bal - amount;
+        Self::set_balance(&env, &from, new_from_bal);
+        let to_bal = Self::balance(env.clone(), to.clone());
+        let new_to_bal = to_bal
+            .checked_add(amount)
+            .unwrap_or_else(|| panic_err(&env, Error::Overflow));
+        Self::set_balance(&env, &to, new_to_bal);
+        env.storage().temporary().set(
+            &key,
+            &AllowanceValue {
+                amount: current.amount - amount,
+                expiration_ledger: current.expiration_ledger,
+            },
+        );
+        Self::bump(&env);
+        env.events().publish(
+            (symbol_short!("transfer"), from, to),
+            (amount, new_from_bal, new_to_bal),
+        );
+    }
+
     /// Current balance of `id`.
     pub fn balance(env: Env, id: Address) -> i128 {
         env.storage()
@@ -371,6 +492,18 @@ impl AssetTokenContract {
         Self::metadata(&env).total_supply
     }
 
+    /// Pause every balance-changing operation. Admin only.
+    ///
+    /// Policy: while paused, `transfer`, `transfer_from`, `mint`,
+    /// `mint_batch` and `burn` all revert with `Error::Paused`. `approve` is
+    /// also rejected (see docs/asset-token.md) so no allowance can be queued
+    /// up to fire the instant the token is unpaused. Read-only calls
+    /// (`balance`, `allowance`, `get_metadata`, `total_supply`) keep working.
+    /// This is intentionally total: a pause is meant to freeze token state
+    /// during an incident, not just block trading while admin actions
+    /// continue.
+    pub fn pause(env: Env, admin: Address) {
+        let mut meta = Self::require_admin(&env, &admin);
     /// Pause all transfers and mints. Callable by the admin, or by the
     /// optional guardian (issue #1) if one has been set via
     /// `set_guardian`. The guardian cannot unpause, mint, or perform any
@@ -415,6 +548,10 @@ impl AssetTokenContract {
 
     /// Update the recorded USD-cents valuation. Admin only.
     ///
+    /// A single update may not move the valuation by more than
+    /// `MAX_VALUATION_CHANGE_BPS` of its previous value (see the constant's
+    /// doc comment for the reasoning). Larger re-appraisals must be phased
+    /// in across multiple `update_valuation` calls.
     /// This updates only the token metadata. If this token is also registered
     /// in the registry, the registry's valuation is an independent snapshot
     /// from registration and is not updated by this call. Clients and
@@ -425,11 +562,24 @@ impl AssetTokenContract {
         if new_valuation < 0 {
             panic_err(&env, Error::InvalidAmount);
         }
+        let old_valuation = meta.valuation;
+        if old_valuation > 0 {
+            let diff = (new_valuation - old_valuation).abs();
+            let max_change = old_valuation
+                .checked_mul(MAX_VALUATION_CHANGE_BPS)
+                .and_then(|v| v.checked_div(BPS_DENOMINATOR))
+                .unwrap_or_else(|| panic_err(&env, Error::Overflow));
+            if diff > max_change {
+                panic_err(&env, Error::ValuationChangeTooLarge);
+            }
+        }
         meta.valuation = new_valuation;
         env.storage().instance().set(&DataKey::Metadata, &meta);
         Self::bump(&env);
-        env.events()
-            .publish((symbol_short!("valuation"),), new_valuation);
+        env.events().publish(
+            (symbol_short!("valuation"),),
+            (old_valuation, new_valuation),
+        );
     }
 
     /// Point the token at a different compliance contract. Admin only.
@@ -441,14 +591,22 @@ impl AssetTokenContract {
     /// misconfigured address before it bricks every transfer.
     pub fn set_compliance(env: Env, admin: Address, compliance: Address) {
         let mut meta = Self::require_admin(&env, &admin);
+        // Probe the target for the expected interface (`is_allowed`) before
+        // accepting the swap: calling it here, before any state changes,
+        // means an address that doesn't implement `ComplianceInterface`
+        // traps this invocation instead of silently bricking every future
+        // transfer once it's already wired in as the gate.
         if !Self::compliant(&env, &compliance, &admin) {
             panic_err(&env, Error::InvalidCompliance);
         }
+        let old_compliance = meta.compliance_contract.clone();
         meta.compliance_contract = compliance.clone();
         env.storage().instance().set(&DataKey::Metadata, &meta);
         Self::bump(&env);
-        env.events()
-            .publish((symbol_short!("setcomp"),), compliance);
+        env.events().publish(
+            (symbol_short!("setcomp"),),
+            (old_compliance, compliance),
+        );
     }
 
     /// Propose a new admin. Requires authorization from the current admin.

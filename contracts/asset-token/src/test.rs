@@ -53,6 +53,54 @@ fn approve(env: &Env, compliance: &ComplianceContractClient, admin: &Address, wh
 }
 
 #[test]
+fn test_approve_then_transfer_from() {
+    let s = setup(1_000);
+    let bob = Address::generate(&s.env);
+    let carol = Address::generate(&s.env);
+    approve(&s.env, &s.compliance, &s.admin, &bob);
+    approve(&s.env, &s.compliance, &s.admin, &carol);
+
+    let expiration = s.env.ledger().sequence() + 1_000;
+    s.token.approve(&s.admin, &bob, &300, &expiration);
+    assert_eq!(s.token.allowance(&s.admin, &bob), 300);
+
+    s.token.transfer_from(&bob, &s.admin, &carol, &200);
+    assert_eq!(s.token.balance(&s.admin), 800);
+    assert_eq!(s.token.balance(&carol), 200);
+    assert_eq!(s.token.allowance(&s.admin, &bob), 100);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #12)")]
+fn test_transfer_from_over_allowance_rejected() {
+    let s = setup(1_000);
+    let bob = Address::generate(&s.env);
+    let carol = Address::generate(&s.env);
+    approve(&s.env, &s.compliance, &s.admin, &bob);
+    approve(&s.env, &s.compliance, &s.admin, &carol);
+
+    let expiration = s.env.ledger().sequence() + 1_000;
+    s.token.approve(&s.admin, &bob, &100, &expiration);
+    s.token.transfer_from(&bob, &s.admin, &carol, &200);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #12)")]
+fn test_transfer_from_after_expiry_rejected() {
+    let s = setup(1_000);
+    let bob = Address::generate(&s.env);
+    let carol = Address::generate(&s.env);
+    approve(&s.env, &s.compliance, &s.admin, &bob);
+    approve(&s.env, &s.compliance, &s.admin, &carol);
+
+    let expiration = s.env.ledger().sequence() + 5;
+    s.token.approve(&s.admin, &bob, &200, &expiration);
+    s.env.ledger().with_mut(|li| li.sequence_number = expiration + 1);
+    assert_eq!(s.token.allowance(&s.admin, &bob), 0);
+    s.token.transfer_from(&bob, &s.admin, &carol, &50);
+}
+
+#[test]
 fn test_version() {
     let s = setup(1_000);
     assert_eq!(s.token.version(), VERSION);
@@ -354,6 +402,37 @@ fn test_mint_blocked_when_paused() {
 }
 
 #[test]
+#[should_panic(expected = "Error(Contract, #6)")]
+fn test_burn_blocked_when_paused() {
+    let s = setup(1_000);
+    s.token.pause(&s.admin);
+    s.token.burn(&s.admin, &100);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #6)")]
+fn test_approve_blocked_when_paused() {
+    let s = setup(1_000);
+    let bob = Address::generate(&s.env);
+    s.token.pause(&s.admin);
+    s.token.approve(&s.admin, &bob, &100, &(s.env.ledger().sequence() + 100));
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #6)")]
+fn test_transfer_from_blocked_when_paused() {
+    let s = setup(1_000);
+    let bob = Address::generate(&s.env);
+    let carol = Address::generate(&s.env);
+    approve(&s.env, &s.compliance, &s.admin, &bob);
+    approve(&s.env, &s.compliance, &s.admin, &carol);
+    let expiration = s.env.ledger().sequence() + 100;
+    s.token.approve(&s.admin, &bob, &100, &expiration);
+    s.token.pause(&s.admin);
+    s.token.transfer_from(&bob, &s.admin, &carol, &50);
+}
+
+#[test]
 fn test_mint_succeeds_after_unpause() {
     let s = setup(1_000);
     let bob = Address::generate(&s.env);
@@ -464,6 +543,23 @@ fn test_update_valuation_negative_rejected() {
 }
 
 #[test]
+#[should_panic(expected = "Error(Contract, #13)")]
+fn test_update_valuation_oversized_change_rejected() {
+    let s = setup(1_000);
+    // Initial valuation is 50_000_000; more than a 50% jump must be rejected.
+    s.token.update_valuation(&s.admin, &200_000_000);
+}
+
+#[test]
+fn test_update_valuation_emits_event() {
+    let s = setup(1_000);
+    let count_before = s.env.events().all().events().len();
+    s.token.update_valuation(&s.admin, &60_000_000);
+    assert_eq!(s.env.events().all().events().len(), count_before + 1);
+    assert_eq!(s.token.get_metadata().valuation, 60_000_000);
+}
+
+#[test]
 fn test_set_compliance_switches_gate() {
     let s = setup(1_000);
     // A fresh compliance contract where the admin is approved.
@@ -475,6 +571,30 @@ fn test_set_compliance_switches_gate() {
     // Sanity: original compliance still knows the admin.
     assert!(s.compliance.is_allowed(&s.admin));
     let _ = &s.compliance_id;
+}
+
+#[test]
+fn test_set_compliance_emits_old_and_new_addresses() {
+    let s = setup(1_000);
+    let comp2_id = env_register_empty_compliance(&s.env, &s.admin);
+    let comp2 = ComplianceContractClient::new(&s.env, &comp2_id);
+    approve(&s.env, &comp2, &s.admin, &s.admin);
+    let old_compliance = s.token.get_metadata().compliance_contract;
+    s.token.set_compliance(&s.admin, &comp2_id);
+    assert_eq!(old_compliance, s.compliance_id);
+    assert_eq!(s.token.get_metadata().compliance_contract, comp2_id);
+    let all_events = s.env.events().all();
+    assert!(!all_events.events().is_empty());
+}
+
+#[test]
+#[should_panic]
+fn test_set_compliance_rejects_non_conforming_target() {
+    let s = setup(1_000);
+    // A plain account address does not implement `is_allowed`; probing it as
+    // a compliance target must fail rather than being silently accepted.
+    let not_a_compliance_contract = Address::generate(&s.env);
+    s.token.set_compliance(&s.admin, &not_a_compliance_contract);
 }
 
 #[test]
@@ -825,8 +945,8 @@ fn test_mint_batch_credits_repeated_recipient_cumulatively() {
 fn test_get_metadata_reflects_all_mutations() {
     let s = setup(1_000);
 
-    // ── Step 1: update_valuation ─────────────────────────────────────────────
-    s.token.update_valuation(&s.admin, &99_000_000);
+    // ── Step 1: update_valuation (within the 50% per-update guard) ───────────
+    s.token.update_valuation(&s.admin, &70_000_000);
 
     // ── Step 2: pause then unpause (paused must end up false) ────────────────
     s.token.pause(&s.admin);
@@ -849,7 +969,7 @@ fn test_get_metadata_reflects_all_mutations() {
     let meta = s.token.get_metadata();
 
     // Fields touched by the setters above.
-    assert_eq!(meta.valuation, 99_000_000, "valuation not updated");
+    assert_eq!(meta.valuation, 70_000_000, "valuation not updated");
     assert!(!meta.paused, "paused flag should be false after unpause");
     assert_eq!(
         meta.compliance_contract, comp2_id,
