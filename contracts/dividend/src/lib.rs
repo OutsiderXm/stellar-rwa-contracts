@@ -11,6 +11,10 @@
 //! post-creation transfers from inflating or diluting any holder's claim.
 //! `created_at` records the ledger at which the distribution was created for reference.
 //!
+//! Entitlements use integer token units and integer division. If the asset token
+//! has zero decimals, it cannot represent fractional holdings, and a small
+//! proportional payment may round down to zero and be unclaimable.
+//!
 //! # Claim deadline & reclaim policy (issue #2)
 //!
 //! A distribution may optionally carry a `deadline` (a ledger sequence number).
@@ -75,6 +79,10 @@ pub struct Distribution {
 #[derive(Clone)]
 enum DataKey {
     Admin,
+    /// Address nominated by the current admin via `propose_admin`, pending
+    /// acceptance via `accept_admin` (issue #4). Absent when there is no
+    /// proposal in flight.
+    PendingAdmin,
     Counter,
     Ids,
     Dist(u64),
@@ -114,13 +122,16 @@ pub enum Error {
     /// duplicate would inflate the denominator while its amount stays
     /// unclaimable — permanently stranding that slice of the escrow.
     DuplicateHolder = 11,
+    /// `accept_admin` or `cancel_admin_proposal` called with no pending
+    /// admin proposal on file (issue #4).
+    NoPendingAdmin = 12,
     /// A claim was attempted after the distribution's `deadline` (issue #2).
-    DeadlinePassed = 12,
+    DeadlinePassed = 13,
     /// `reclaim_unclaimed` was called before the deadline (issue #2).
-    DeadlineNotReached = 13,
+    DeadlineNotReached = 14,
     /// `reclaim_unclaimed` was called on a distribution with no deadline set
     /// (`deadline == 0`), i.e. one whose policy never permits reclaiming.
-    NoDeadline = 14,
+    NoDeadline = 15,
 }
 
 const DAY_IN_LEDGERS: u32 = 17_280;
@@ -207,6 +218,10 @@ impl DividendContract {
     ) -> u64 {
         Self::require_admin(&env, &admin);
         if total_amount <= 0 {
+            panic_err(&env, Error::InvalidAmount);
+        }
+        // Reject distributions with empty eligible set (issue #365).
+        if eligible.len() == 0 {
             panic_err(&env, Error::InvalidAmount);
         }
         // Reject distributions where no holder can ever claim (issue #49).
@@ -348,7 +363,8 @@ impl DividendContract {
         if basis <= 0 {
             return 0;
         }
-        // Proportional share, floored by integer division. Guard the
+        // Proportional share, floored by integer division. For zero-decimal
+        // asset tokens this can make small claims equal to zero. Guard the
         // multiplication against i128 overflow (issue #165).
         dist.total_amount
             .checked_mul(basis)
@@ -435,8 +451,8 @@ impl DividendContract {
     /// Sweep whatever remains unclaimed (`total_amount - distributed`) out of
     /// escrow to the admin, once a distribution's deadline has passed.
     /// Admin-authorized only (issue #2 policy). Errors:
-    /// `NoDeadline (#14)` if the distribution has no deadline set;
-    /// `DeadlineNotReached (#13)` if called before the deadline;
+    /// `NoDeadline (#15)` if the distribution has no deadline set;
+    /// `DeadlineNotReached (#14)` if called before the deadline;
     /// `NothingToClaim (#6)` if everything was already claimed or reclaimed.
     pub fn reclaim_unclaimed(env: Env, admin: Address, distribution_id: u64) -> i128 {
         Self::require_admin(&env, &admin);
@@ -477,6 +493,34 @@ impl DividendContract {
             (distribution_id, remaining),
         );
         remaining
+    }
+
+    /// Cancel a distribution and return escrowed funds to the issuer.
+    /// Only works while nothing has been claimed (distributed == 0). Admin only.
+    pub fn cancel_distribution(env: Env, admin: Address, distribution_id: u64) {
+        Self::require_admin(&env, &admin);
+        let dist = Self::load(&env, distribution_id);
+        // Only allow cancellation before any claim is made (issue #366).
+        if dist.distributed > 0 {
+            panic_err(&env, Error::InvalidAmount);
+        }
+        // Return escrowed funds to the issuer.
+        let this = env.current_contract_address();
+        TokenClient::new(&env, &dist.payment_token).transfer(&this, &admin, &dist.total_amount);
+        // Mark as completed so no further claims are possible.
+        let mut cancelled_dist = dist;
+        cancelled_dist.completed = true;
+        env.storage()
+            .persistent()
+            .set(&DataKey::Dist(distribution_id), &cancelled_dist);
+        env.storage().persistent().extend_ttl(
+            &DataKey::Dist(distribution_id),
+            INSTANCE_LIFETIME_THRESHOLD,
+            INSTANCE_BUMP_AMOUNT,
+        );
+        bump(&env);
+        env.events()
+            .publish((symbol_short!("cancel"), admin), distribution_id);
     }
 
     /// Fetch a distribution by id.
@@ -553,6 +597,68 @@ impl DividendContract {
             .instance()
             .get(&DataKey::Admin)
             .unwrap_or_else(|| panic_err(&env, Error::NotInitialized))
+    }
+
+    /// Propose a new admin. Requires authorization from the current admin.
+    /// The role does not move yet — `new_admin` must call `accept_admin`
+    /// before the handover takes effect (issue #4). This makes a mistyped
+    /// `new_admin` harmless (it can simply be re-proposed or cancelled)
+    /// instead of a single-step transfer that would permanently brick
+    /// administration.
+    pub fn propose_admin(env: Env, admin: Address, new_admin: Address) {
+        Self::require_admin(&env, &admin);
+        env.storage()
+            .instance()
+            .set(&DataKey::PendingAdmin, &new_admin);
+        bump(&env);
+        env.events()
+            .publish((symbol_short!("proposed"), admin), new_admin);
+    }
+
+    /// Cancel a pending admin proposal. Requires authorization from the
+    /// current admin. Panics with `NoPendingAdmin` if there is nothing to
+    /// cancel.
+    pub fn cancel_admin_proposal(env: Env, admin: Address) {
+        Self::require_admin(&env, &admin);
+        if !env.storage().instance().has(&DataKey::PendingAdmin) {
+            panic_err(&env, Error::NoPendingAdmin);
+        }
+        env.storage().instance().remove(&DataKey::PendingAdmin);
+        bump(&env);
+        env.events()
+            .publish((symbol_short!("cancelled"), admin), ());
+    }
+
+    /// Accept a pending admin proposal, completing the handover. Must be
+    /// called by the proposed successor (issue #4); the role only ever moves
+    /// here, never in `propose_admin`. Emits `set_admin` carrying both the
+    /// previous and new admin so off-chain indexers can observe this
+    /// security-critical transition (issue #2).
+    pub fn accept_admin(env: Env, new_admin: Address) {
+        new_admin.require_auth();
+        let pending: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::PendingAdmin)
+            .unwrap_or_else(|| panic_err(&env, Error::NoPendingAdmin));
+        if pending != new_admin {
+            panic_err(&env, Error::Unauthorized);
+        }
+        let old_admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .unwrap_or_else(|| panic_err(&env, Error::NotInitialized));
+        env.storage().instance().set(&DataKey::Admin, &new_admin);
+        env.storage().instance().remove(&DataKey::PendingAdmin);
+        bump(&env);
+        env.events()
+            .publish((symbol_short!("set_admin"), old_admin), new_admin);
+    }
+
+    /// The address currently proposed as the next admin, if any.
+    pub fn get_pending_admin(env: Env) -> Option<Address> {
+        env.storage().instance().get(&DataKey::PendingAdmin)
     }
 
     // ---- internal helpers ----

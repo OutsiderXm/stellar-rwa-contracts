@@ -14,8 +14,11 @@ At claim time a holder can claim:
 claimable = total_amount * balance(holder) / total_supply
 ```
 
-where `balance` and `total_supply` are read live from the asset token. Integer
-division floors the result. Each holder can claim a given distribution **once**.
+where `balance` and `total_supply` are represented in the asset token's raw
+integer units. Integer division floors the result. With an asset token using
+zero decimals, fractional holdings cannot be represented and a small claim can
+round to zero, making it unclaimable. Each holder can claim a given
+distribution **once**.
 
 ### Rounding & dust (issue #4)
 
@@ -53,7 +56,7 @@ can recover stranded funds (requires a `deadline`), and
    deadline: the distribution is claimable forever and can never be
    reclaimed.
 2. `create_distribution_deadline(..., deadline)` sets a ledger sequence
-   number after which `claim` is rejected with `DeadlinePassed (#12)`. Up to
+   number after which `claim` is rejected with `DeadlinePassed (#13)`. Up to
    and including that ledger, claiming works normally.
 3. After the deadline passes, and **only** the contract **admin** (not the
    issuer, not any holder) may call `reclaim_unclaimed(admin, distribution_id)`
@@ -63,8 +66,8 @@ can recover stranded funds (requires a `deadline`), and
    holder-entitled funds.
 4. Reclaiming marks the distribution `completed` (as if fully claimed) and
    clears its snapshot/supply storage. Reclaiming twice, reclaiming before
-   the deadline (`DeadlineNotReached (#13)`), or reclaiming a distribution
-   with no deadline set (`NoDeadline (#14)`) are all rejected.
+   the deadline (`DeadlineNotReached (#14)`), or reclaiming a distribution
+   with no deadline set (`NoDeadline (#15)`) are all rejected.
 
 ## Cross-contract interfaces
 
@@ -98,14 +101,22 @@ pub trait TokenInterface {
   (0 if already claimed / holds nothing / empty supply). Never panics.
 - `claim(distribution_id, holder)` — holder auth; pays the claimable amount from
   escrow, marks claimed, updates `distributed`/`completed`. Errors:
-  `AlreadyClaimed (#7)`, `NothingToClaim (#6)`, `DeadlinePassed (#12)`.
+  `AlreadyClaimed (#7)`, `NothingToClaim (#6)`, `DeadlinePassed (#13)`.
 - `reclaim_unclaimed(admin, distribution_id) -> i128` — admin auth; after the
   deadline, sweeps `total_amount - distributed` to the admin. Errors:
-  `NoDeadline (#14)`, `DeadlineNotReached (#13)`, `NothingToClaim (#6)`.
+  `NoDeadline (#15)`, `DeadlineNotReached (#14)`, `NothingToClaim (#6)`.
+- `cancel_distribution(admin, distribution_id)` — admin auth; returns escrowed
+  funds to the issuer. Only works while nothing has been claimed (`distributed == 0`).
+  Errors: `InvalidAmount (#5)` if any claim has been made.
 - `get_distribution(distribution_id) -> Distribution` — `DistributionNotFound (#4)`.
 - `get_distributions_for_asset(asset_token) -> Vec<Distribution>`
 - `has_claimed(distribution_id, holder) -> bool`
 - `get_admin() -> Address`
+- `propose_admin(admin, new_admin)` — admin auth; records a pending successor.
+  The role does not move yet.
+- `accept_admin(new_admin)` — pending successor's auth; completes the handover.
+- `cancel_admin_proposal(admin)` — admin auth; clears the pending successor.
+  See [issue #4](fixes/issue-4.md) for the rationale.
 
 ## Errors
 
@@ -130,18 +141,28 @@ pub trait TokenInterface {
 | `init`    | admin                      | initialize          |
 | `created` | (admin) → (id, total)      | distribution funded |
 | `claim`   | (holder) → (id, amount)    | holder claims       |
+| `cancel`  | (admin) → distribution_id  | distribution cancelled |
+| `set_admin` | (old_admin) → new_admin | admin handed over    |
 
 ## Storage / TTL
 
-Listing of the contract `DataKey` variants and their storage behaviour.
+Listing of the contract `DataKey` variants and their storage behaviour. This
+table is generated from the `DataKey` enum in `contracts/dividend/src/lib.rs`
+via `scripts/generate_storage_docs.py` and reflects the snapshot-based
+distribution model (issue #163): `Snapshot` and `Supply` freeze the
+entitlement basis at `create_distribution` time, and `AssetIds` indexes
+distributions per asset token (issue #166).
 
 | Key | Payload | Storage | TTL / Notes |
 |-----|---------|---------|-------------|
-| `Admin` | - | instance | - |
-| `Counter` | - | instance | - |
-| `Ids` | - | unknown | - |
-| `Dist` | u64 | persistent | extended via instance() |
-| `Claimed` | u64, Address | unknown | per-key TTL |
+| `Admin` | - | instance | set once in `initialize`; never removed |
+| `Counter` | - | instance | monotonically increasing distribution id |
+| `Ids` | - | unused | legacy variant kept in the enum for ABI/storage-key stability; not read or written by any function |
+| `Dist(u64)` | distribution id | persistent | `extend_ttl` on create and on every `claim`/`complete` update |
+| `Claimed(u64, Address)` | distribution id, holder | persistent | set once per `(distribution, holder)` on `claim`; no explicit `extend_ttl` call |
+| `AssetIds(Address)` | asset token | persistent | `Vec<u64>` of distribution ids for that asset token; appended and TTL-extended on every `create_distribution` |
+| `Supply(u64)` | distribution id | persistent | snapshot total supply (the `claimable` denominator), frozen at creation; TTL-extended on create; removed once the distribution completes |
+| `Snapshot(u64)` | distribution id | persistent | the frozen `eligible: Vec<(Address, i128)>` entitlement list; TTL-extended on create; removed once the distribution completes |
 
 ## Security considerations
 

@@ -59,6 +59,51 @@ in metadata and can be swapped with `set_compliance`.
 - `get_metadata() -> AssetMetadata`
 - `update_valuation(admin, new_valuation)` — admin auth.
 - `set_compliance(admin, compliance)` — admin auth; repoints the gate.
+- `propose_admin(admin, new_admin)` — admin auth; records a pending successor.
+  The role does not move yet.
+- `accept_admin(new_admin)` — pending successor's auth; completes the handover.
+- `cancel_admin_proposal(admin)` — admin auth; clears the pending successor.
+  See [issue #4](fixes/issue-4.md) for the rationale.
+
+## Swapping compliance mid-life
+
+`set_compliance` repoints the gate at a different contract. The token stores only
+the compliance *address*; it does not snapshot or migrate any approval state.
+Because approvals live in the compliance contract, not in the token, the set of
+addresses that pass `is_allowed` is entirely determined by whichever contract is
+currently referenced. Repointing the gate therefore **silently changes who can
+transact**:
+
+- Addresses approved under the old contract may not be approved under the new
+  one. Their existing balances remain, but their `transfer`/`mint` calls will
+  start reverting with `SenderNotCompliant` (#7) or `RecipientNotCompliant` (#8).
+- Addresses that were *not* approved under the old contract may become approved
+  under the new one, gaining the ability to receive or move the asset.
+- The change takes effect immediately for the next `transfer`/`mint`; there is no
+  grace period and no per-address migration. `burn` is unaffected (it does not
+  consult compliance).
+- The swap is not reversible in terms of state: repointing back to the old
+  contract restores the old approval set only if that contract's state is
+  unchanged.
+
+### Recommended migration procedure
+
+1. **Stage the new compliance contract** and populate it with the intended
+   approval set (KYC/allow-list) before touching the token.
+2. **Diff the approval sets** off-chain: compute the addresses approved under the
+   old contract and under the new one, and identify addresses that would lose
+   approval.
+3. **Notify affected holders** and complete any required re-approval (KYC) so
+   they are approved under the new contract *before* the swap.
+4. **Pause the token** (`pause`) to halt transfers/mints while the gate is being
+   changed, avoiding a window where some holders are unexpectedly blocked.
+5. **Call `set_compliance(admin, new)`** (admin auth). This emits `setcomp`.
+6. **Verify** by checking `get_metadata().compliance_contract` and probing a few
+   known addresses with the new contract's `is_allowed`.
+7. **Unpause** (`unpause`) once the new gate is confirmed correct.
+
+Keep the old compliance contract deployed and unchanged until the migration is
+confirmed, so the swap can be rolled back by repointing to it if needed.
 
 ## Errors
 
@@ -85,6 +130,7 @@ in metadata and can be swapped with `set_compliance`.
 | `unpause`   | admin                   | unpause      |
 | `valuation` | new valuation           | valuation up |
 | `setcomp`   | compliance address      | gate changed |
+| `set_admin` | (old_admin) → new_admin | admin handed over |
 
 ## Storage / TTL
 
@@ -102,3 +148,18 @@ Listing of the contract `DataKey` variants and their storage behaviour.
 - Amounts must be strictly positive; zero/negative amounts revert.
 - `mint` overflow is checked; supply cannot wrap.
 - Only the admin can pause, mint, change valuation, or repoint compliance.
+- Repointing compliance with `set_compliance` changes the effective approval set
+  immediately; see "Swapping compliance mid-life" above for the operational
+  consequences and the recommended migration procedure.
+
+## Edge-case policy decisions
+
+These behaviours were previously implicit/accidental; they are now
+deliberate and pinned by tests in `contracts/asset-token/src/test.rs`.
+
+| Case | Decision | Rationale | Test |
+|------|----------|-----------|------|
+| Zero-amount `transfer`/`mint`/`burn` | **Rejected** with `InvalidAmount` (#5) | A no-op call that still emits an event and costs fees is misleading; callers must skip the call instead. | `test_zero_amount_rejected` |
+| Self-transfer (`from == to`) | **Allowed**, short-circuited to a true no-op (balances untouched, event still emitted) | Rejecting it forces callers to special-case an address match themselves; a no-op is safe and simpler, and avoids a double-apply bug in naive debit/credit code. | `test_self_transfer_no_inflation`, `test_self_transfer_exceeding_balance_fails`, `test_self_transfer_by_suspended_holder_fails` |
+| Burn by a suspended/non-compliant holder | **Rejected** with `SenderNotCompliant` (#7) | `burn` still mutates balance and total supply, so it is gated exactly like the `from` side of a `transfer`; suspension cannot be bypassed via self-burn. | `test_burn_blocked_when_holder_not_compliant`, `test_burn_blocked_when_holder_suspended` |
+| Mint to a non-compliant recipient | **Rejected** with `RecipientNotCompliant` (#8) | Minting is the only way new supply enters circulation; leaving it ungated would let tokens reach an address no `transfer` could ever reach. `mint_batch` applies the same check per recipient. | `test_mint_to_noncompliant_fails`, `test_mint_batch_reverts_entirely_on_noncompliant_recipient` |
