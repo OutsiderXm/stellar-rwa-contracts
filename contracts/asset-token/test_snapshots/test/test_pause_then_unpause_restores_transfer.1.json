@@ -748,6 +748,12 @@
                           },
                           {
                             "key": {
+                              "symbol": "guardian"
+                            },
+                            "val": "void"
+                          },
+                          {
+                            "key": {
                               "symbol": "name"
                             },
                             "val": {
@@ -761,6 +767,12 @@
                             "val": {
                               "bool": false
                             }
+                          },
+                          {
+                            "key": {
+                              "symbol": "pending_admin"
+                            },
+                            "val": "void"
                           },
                           {
                             "key": {

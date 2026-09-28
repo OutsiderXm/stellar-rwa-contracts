@@ -1139,6 +1139,12 @@
                           },
                           {
                             "key": {
+                              "symbol": "guardian"
+                            },
+                            "val": "void"
+                          },
+                          {
+                            "key": {
                               "symbol": "name"
                             },
                             "val": {
@@ -1152,6 +1158,12 @@
                             "val": {
                               "bool": false
                             }
+                          },
+                          {
+                            "key": {
+                              "symbol": "pending_admin"
+                            },
+                            "val": "void"
                           },
                           {
                             "key": {
@@ -1259,6 +1271,14 @@
                   {
                     "key": {
                       "symbol": "created_at"
+                    },
+                    "val": {
+                      "u32": 0
+                    }
+                  },
+                  {
+                    "key": {
+                      "symbol": "deadline"
                     },
                     "val": {
                       "u32": 0
