@@ -12,6 +12,21 @@ asset token, compliance rules, dividend distribution, and a registry.
 | `dividend` | Dividend distribution to token holders |
 | `registry` | Registry of assets and their metadata |
 
+Every privileged (admin- or self-authorized) function across all four
+contracts, the role it requires, and the error raised for the wrong caller
+is documented in the [Authority Matrix](docs/AUTHORITY_MATRIX.md).
+
+## How compliance gating works
+
+```
+transfer(from, to, amount)
+  ├─ from.require_auth()
+  ├─ assert !paused
+  ├─ compliance.is_allowed(from)   ── cross-contract call ──►  compliance contract
+  ├─ compliance.is_allowed(to)     ── cross-contract call ──►  compliance contract
+  └─ move balances + emit event
+```
+
 ## Building
 
 ```sh
@@ -78,3 +93,20 @@ Runs the full test suite with no network access.
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for local Soroban setup. Please keep
 `cargo fmt` clean — CI enforces it.
+
+## Sister repos
+
+- **Web app:** https://github.com/RWA-ToolKit/stellar-rwa-web
+- **API + Docs:** https://github.com/RWA-ToolKit/stellar-rwa-api-docs
+
+## License
+
+MIT — see [LICENSE](LICENSE).
+
+## Handsoff notes
+
+<!-- handsoff-issue-390 -->
+- #390: Test concurrent claims against the same distribution
+
+<!-- handsoff-issue-400 -->
+- #400: Add an integration test exercising all four contracts together
