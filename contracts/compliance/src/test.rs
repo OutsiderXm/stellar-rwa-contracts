@@ -1026,3 +1026,95 @@ fn test_get_allowlist_page_limit_clamped_to_max() {
     assert_eq!(via_zero.len(), 1);
     assert_eq!(via_huge.len(), 1);
 }
+
+// ---- issue: is_allowed must explicitly reject every non-Approved status ----
+
+#[test]
+fn test_is_allowed_rejects_pending_status() {
+    // `Pending` has no public setter today, so we write the record directly
+    // via storage (as a future KYC-submission workflow would) and assert
+    // `is_allowed` still rejects it, not just "no record found".
+    let (env, client, _admin) = setup();
+    let user = Address::generate(&env);
+    let us = String::from_str(&env, "US");
+    env.as_contract(&client.address, || {
+        env.storage().persistent().set(
+            &DataKey::Record(user.clone()),
+            &KycRecord {
+                address: user.clone(),
+                status: ComplianceStatus::Pending,
+                jurisdiction: us,
+                verified_at: 0,
+                expires_at: 0,
+            },
+        );
+    });
+    assert_eq!(client.status_of(&user), Some(ComplianceStatus::Pending));
+    assert!(!client.is_allowed(&user));
+}
+
+#[test]
+fn test_is_allowed_rejects_rejected_status() {
+    let (env, client, _admin) = setup();
+    let user = Address::generate(&env);
+    let us = String::from_str(&env, "US");
+    env.as_contract(&client.address, || {
+        env.storage().persistent().set(
+            &DataKey::Record(user.clone()),
+            &KycRecord {
+                address: user.clone(),
+                status: ComplianceStatus::Rejected,
+                jurisdiction: us,
+                verified_at: 0,
+                expires_at: 0,
+            },
+        );
+    });
+    assert_eq!(client.status_of(&user), Some(ComplianceStatus::Rejected));
+    assert!(!client.is_allowed(&user));
+}
+
+#[test]
+fn test_is_allowed_rejects_suspended_status() {
+    // Suspended is already exercised via `test_suspend_blocks_transfer`, but
+    // this asserts it alongside its Pending/Rejected siblings so all three
+    // non-Approved statuses are covered by name, not just generically.
+    let (env, client, admin) = setup();
+    let user = Address::generate(&env);
+    let us = String::from_str(&env, "US");
+    client.add_to_allowlist(&admin, &user, &us, &0);
+    client.suspend(&admin, &user);
+    assert_eq!(client.status_of(&user), Some(ComplianceStatus::Suspended));
+    assert!(!client.is_allowed(&user));
+}
+
+// ---- issue: expose the blocked-jurisdiction set as a direct read ----
+
+#[test]
+fn test_get_blocked_jurisdictions_round_trip() {
+    let (env, client, admin) = setup();
+    let ir = String::from_str(&env, "IR");
+    let kp = String::from_str(&env, "KP");
+
+    assert_eq!(client.get_blocked_jurisdictions().len(), 0);
+
+    client.block_jurisdiction(&admin, &ir);
+    let after_first = client.get_blocked_jurisdictions();
+    assert_eq!(after_first.len(), 1);
+    assert_eq!(after_first.get(0).unwrap(), ir);
+
+    client.block_jurisdiction(&admin, &kp);
+    let after_second = client.get_blocked_jurisdictions();
+    assert_eq!(after_second.len(), 2);
+
+    // Blocking an already-blocked jurisdiction again must not duplicate it.
+    client.block_jurisdiction(&admin, &ir);
+    assert_eq!(client.get_blocked_jurisdictions().len(), 2);
+
+    client.unblock_jurisdiction(&admin, &ir);
+    let after_unblock = client.get_blocked_jurisdictions();
+    assert_eq!(after_unblock.len(), 1);
+    assert_eq!(after_unblock.get(0).unwrap(), kp);
+    assert!(!client.is_jurisdiction_blocked(&ir));
+    assert!(client.is_jurisdiction_blocked(&kp));
+}

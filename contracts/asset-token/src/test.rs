@@ -711,6 +711,37 @@ fn test_mint_batch_reverts_entirely_on_noncompliant_recipient() {
 }
 
 #[test]
+fn test_mint_batch_partial_failure_does_not_touch_prior_balance() {
+    // Stronger atomicity proof than a fresh-recipient check: bob already
+    // holds a balance before the batch runs, so a naive "credit as you go"
+    // implementation could still leave his balance bumped even though the
+    // whole call is supposed to revert. This asserts it is left exactly as
+    // it was.
+    let s = setup(1_000);
+    let bob = Address::generate(&s.env);
+    let carol = Address::generate(&s.env);
+    let eve = Address::generate(&s.env); // never approved
+    approve(&s.env, &s.compliance, &s.admin, &bob);
+    approve(&s.env, &s.compliance, &s.admin, &carol);
+
+    s.token.mint(&s.admin, &bob, &500);
+    let bob_balance_before = s.token.balance(&bob);
+    let supply_before = s.token.total_supply();
+
+    let mut recipients = Vec::new(&s.env);
+    recipients.push_back((bob.clone(), 100i128));
+    recipients.push_back((carol.clone(), 25i128));
+    recipients.push_back((eve, 50i128));
+
+    let res = s.token.try_mint_batch(&s.admin, &recipients);
+    assert_eq!(res, Err(Ok(Error::RecipientNotCompliant.into())));
+
+    assert_eq!(s.token.balance(&bob), bob_balance_before);
+    assert_eq!(s.token.balance(&carol), 0);
+    assert_eq!(s.token.total_supply(), supply_before);
+}
+
+#[test]
 #[should_panic(expected = "Error(Contract, #7)")]
 fn test_transfer_after_sender_suspended_post_mint_panics_sender_not_compliant() {
     let s = setup(1_000);

@@ -50,7 +50,9 @@ pub struct AllowlistEntry {
 pub struct KycRecord {
     pub address: Address,
     pub status: ComplianceStatus,
-    /// ISO country code, e.g. "US", "KE", "DE".
+    /// Canonical ISO-3166-1 alpha-2 country code, e.g. "US", "KE", "DE".
+    /// Always exactly 2 uppercase ASCII letters; see [`normalize_jurisdiction`]
+    /// for the enforced canonical form.
     pub jurisdiction: String,
     /// Ledger sequence at which the record was verified.
     pub verified_at: u32,
@@ -85,6 +87,11 @@ enum DataKey {
     AllowlistCount,
     Record(Address),
     Blocked(String),
+    /// Ordered list of every jurisdiction currently blocked, kept in sync
+    /// with the individual `Blocked(String)` flags so the full blocked set
+    /// can be read directly instead of being inferred off-chain from the
+    /// absence of approved addresses in a jurisdiction.
+    BlockedList,
 }
 
 /// Max addresses per allowlist page (issue #177). Bounds the size of any single
@@ -475,9 +482,19 @@ impl ComplianceContract {
     pub fn block_jurisdiction(env: Env, admin: Address, jurisdiction: String) {
         Self::require_admin(&env, &admin);
         let jurisdiction = normalize_jurisdiction(&env, &jurisdiction);
+        let already_blocked: bool = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Blocked(jurisdiction.clone()))
+            .unwrap_or(false);
         env.storage()
             .persistent()
             .set(&DataKey::Blocked(jurisdiction.clone()), &true);
+        if !already_blocked {
+            let mut list = Self::blocked_list(&env);
+            list.push_back(jurisdiction.clone());
+            env.storage().instance().set(&DataKey::BlockedList, &list);
+        }
         Self::bump_instance(&env);
         env.events()
             .publish((symbol_short!("blockjur"),), jurisdiction);
@@ -490,6 +507,14 @@ impl ComplianceContract {
         env.storage()
             .persistent()
             .remove(&DataKey::Blocked(jurisdiction.clone()));
+        let list = Self::blocked_list(&env);
+        let mut next = Vec::new(&env);
+        for j in list.iter() {
+            if j != jurisdiction {
+                next.push_back(j);
+            }
+        }
+        env.storage().instance().set(&DataKey::BlockedList, &next);
         Self::bump_instance(&env);
         env.events()
             .publish((symbol_short!("unblkjur"),), jurisdiction);
@@ -694,6 +719,14 @@ impl ComplianceContract {
             .persistent()
             .get(&DataKey::Record(address.clone()))
             .unwrap_or_else(|| panic_with_error(env, Error::RecordNotFound))
+    }
+
+    /// The current blocked-jurisdiction list, or empty if none are blocked.
+    fn blocked_list(env: &Env) -> Vec<String> {
+        env.storage()
+            .instance()
+            .get(&DataKey::BlockedList)
+            .unwrap_or_else(|| Vec::new(env))
     }
 
     fn bump_instance(env: &Env) {

@@ -52,6 +52,14 @@ in metadata and can be swapped with `set_compliance`.
   `from` has balance; moves tokens.
 - `mint(admin, to, amount)` — admin auth; not paused; `to` compliant; increases
   supply.
+- `mint_batch(admin, recipients: Vec<(Address, i128)>)` — admin auth; not
+  paused; mints each `(recipient, amount)` pair. **Atomic (all-or-nothing):**
+  if any recipient in the vector fails compliance, has an invalid amount, or
+  would overflow total supply, the entire call reverts — no recipient
+  processed earlier in the vector keeps a credited balance, and total supply
+  is unchanged. There is no partial-mint outcome; callers who want a
+  best-effort mint must filter `recipients` against the compliance contract
+  themselves before calling.
 - `burn(from, amount)` — `from` auth; reduces caller balance and supply.
 - `balance(id) -> i128`
 - `total_supply() -> i128`
