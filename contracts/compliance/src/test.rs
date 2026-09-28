@@ -885,3 +885,144 @@ fn test_propose_admin_can_be_re_proposed_to_a_different_successor() {
     client.accept_admin(&second);
     assert_eq!(client.get_admin(), second);
 }
+
+// ---- issue: expires_at = 0 sentinel never lapses ----
+
+#[test]
+fn test_zero_expiry_never_lapses() {
+    let (env, client, admin) = setup();
+    let user = Address::generate(&env);
+    let us = String::from_str(&env, "US");
+    client.add_to_allowlist(&admin, &user, &us, &0);
+    assert!(client.is_allowed(&user));
+
+    // Advance the ledger sequence far past any realistic expiry and confirm
+    // a zero-expiry record is still valid.
+    env.ledger().with_mut(|l| l.sequence_number = 10_000_000);
+    assert!(client.is_allowed(&user));
+    let rec = client.get_record(&user).unwrap();
+    assert_eq!(rec.expires_at, 0);
+}
+
+// ---- issue: get_allowlist_count backed by a maintained counter ----
+
+#[test]
+fn test_allowlist_count_tracks_add_remove_suspend() {
+    let (env, client, admin) = setup();
+    let a = Address::generate(&env);
+    let b = Address::generate(&env);
+    let us = String::from_str(&env, "US");
+
+    assert_eq!(client.get_allowlist_count(), 0);
+
+    client.add_to_allowlist(&admin, &a, &us, &0);
+    assert_eq!(client.get_allowlist_count(), 1);
+
+    client.add_to_allowlist(&admin, &b, &us, &0);
+    assert_eq!(client.get_allowlist_count(), 2);
+
+    // Suspend does not remove the address from the allowlist, so the
+    // maintained counter must not drift.
+    client.suspend(&admin, &a);
+    assert_eq!(client.get_allowlist_count(), 2);
+    assert_eq!(client.get_allowlist_count(), client.get_allowlist().len());
+
+    // Re-approving an existing (suspended) address is not a fresh append.
+    client.add_to_allowlist(&admin, &a, &us, &0);
+    assert_eq!(client.get_allowlist_count(), 2);
+
+    client.remove(&admin, &a);
+    assert_eq!(client.get_allowlist_count(), 1);
+    assert_eq!(client.get_allowlist_count(), client.get_allowlist().len());
+
+    client.remove(&admin, &b);
+    assert_eq!(client.get_allowlist_count(), 0);
+}
+
+// ---- issue: reinstate a suspended address preserving KYC metadata ----
+
+#[test]
+fn test_reinstate_preserves_jurisdiction_and_verified_at() {
+    let (env, client, admin) = setup();
+    let user = Address::generate(&env);
+    let ke = String::from_str(&env, "KE");
+
+    env.ledger().with_mut(|l| l.sequence_number = 50);
+    client.add_to_allowlist(&admin, &user, &ke, &0);
+    let original = client.get_record(&user).unwrap();
+
+    env.ledger().with_mut(|l| l.sequence_number = 60);
+    client.suspend(&admin, &user);
+    assert!(!client.is_allowed(&user));
+    assert_eq!(client.status_of(&user), Some(ComplianceStatus::Suspended));
+
+    env.ledger().with_mut(|l| l.sequence_number = 70);
+    client.reinstate(&admin, &user);
+
+    assert!(client.is_allowed(&user));
+    let reinstated = client.get_record(&user).unwrap();
+    assert_eq!(reinstated.status, ComplianceStatus::Approved);
+    assert_eq!(reinstated.jurisdiction, original.jurisdiction);
+    assert_eq!(reinstated.verified_at, original.verified_at);
+    assert_eq!(reinstated.expires_at, original.expires_at);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #7)")]
+fn test_reinstate_non_suspended_rejected() {
+    let (env, client, admin) = setup();
+    let user = Address::generate(&env);
+    let us = String::from_str(&env, "US");
+    client.add_to_allowlist(&admin, &user, &us, &0);
+    client.reinstate(&admin, &user);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #3)")]
+fn test_reinstate_missing_record_rejected() {
+    let (env, client, admin) = setup();
+    let ghost = Address::generate(&env);
+    client.reinstate(&admin, &ghost);
+}
+
+// ---- issue: paginated allowlist listing ----
+
+#[test]
+fn test_get_allowlist_page_offset_and_limit() {
+    let (env, client, admin) = setup();
+    let us = String::from_str(&env, "US");
+    let mut addrs: Vec<Address> = Vec::new(&env);
+    for _ in 0..5 {
+        let a = Address::generate(&env);
+        client.add_to_allowlist(&admin, &a, &us, &0);
+        addrs.push_back(a);
+    }
+
+    let page1 = client.get_allowlist_page(&0, &2);
+    assert_eq!(page1.len(), 2);
+    let page2 = client.get_allowlist_page(&2, &2);
+    assert_eq!(page2.len(), 2);
+    // Final partial page.
+    let page3 = client.get_allowlist_page(&4, &2);
+    assert_eq!(page3.len(), 1);
+    assert_eq!(page3.get(0).unwrap(), addrs.get(4).unwrap());
+
+    // Past the end returns empty.
+    let page4 = client.get_allowlist_page(&5, &2);
+    assert_eq!(page4.len(), 0);
+}
+
+#[test]
+fn test_get_allowlist_page_limit_clamped_to_max() {
+    let (env, client, admin) = setup();
+    let us = String::from_str(&env, "US");
+    let a = Address::generate(&env);
+    client.add_to_allowlist(&admin, &a, &us, &0);
+
+    // limit=0 and an oversized limit both clamp to MAX_ALLOWLIST_PAGE_SIZE,
+    // which is still satisfied by whatever is actually on the allowlist.
+    let via_zero = client.get_allowlist_page(&0, &0);
+    let via_huge = client.get_allowlist_page(&0, &(MAX_ALLOWLIST_PAGE_SIZE + 1000));
+    assert_eq!(via_zero.len(), 1);
+    assert_eq!(via_huge.len(), 1);
+}

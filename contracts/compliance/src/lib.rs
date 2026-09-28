@@ -54,7 +54,11 @@ pub struct KycRecord {
     pub jurisdiction: String,
     /// Ledger sequence at which the record was verified.
     pub verified_at: u32,
-    /// Ledger sequence at which approval expires; `0` = never expires.
+    /// Ledger sequence at which approval expires.
+    ///
+    /// Sentinel: `0` means the approval **never expires**. See the
+    /// module-level "The `expires_at = 0` sentinel" section for why this is
+    /// safe and how [`ComplianceContract::is_allowed`] treats it.
     pub expires_at: u32,
 }
 
@@ -75,6 +79,10 @@ enum DataKey {
     AllowlistPage(u32),
     /// Which page an address currently lives on, for O(1) removal.
     AllowlistPageOf(Address),
+    /// Maintained counter of addresses currently on the allowlist, kept in
+    /// sync by `append_to_allowlist` / `remove_from_allowlist` so
+    /// `get_allowlist_count` never has to walk any pages.
+    AllowlistCount,
     Record(Address),
     Blocked(String),
 }
@@ -82,6 +90,12 @@ enum DataKey {
 /// Max addresses per allowlist page (issue #177). Bounds the size of any single
 /// storage entry regardless of how large the KYC list grows.
 const ALLOWLIST_PAGE_SIZE: u32 = 200;
+
+/// Maximum number of addresses `get_allowlist_page` will return in a single
+/// call, regardless of the requested `limit`. Callers that pass `0` or a
+/// value greater than this get back exactly this many entries (or fewer, on
+/// the final partial page).
+pub const MAX_ALLOWLIST_PAGE_SIZE: u32 = 200;
 
 /// Typed contract errors. Signalled via `panic_with_error!`, which produces a
 /// deterministic contract error (not an unhandled host panic).
@@ -275,6 +289,27 @@ impl ComplianceContract {
             .publish((symbol_short!("suspend"), address), ());
     }
 
+    /// Reinstate a `Suspended` address without discarding its original KYC
+    /// metadata. Unlike calling `add_to_allowlist` again (which requires the
+    /// caller to resupply `jurisdiction`/`expires_at` and overwrites
+    /// `verified_at`), `reinstate` flips the status back to `Approved` and
+    /// leaves `jurisdiction`, `verified_at` and `expires_at` untouched.
+    /// Admin only. Errors: `RecordNotFound (#3)`, `NotSuspended (#7)`.
+    pub fn reinstate(env: Env, admin: Address, address: Address) {
+        Self::require_admin(&env, &admin);
+        let mut record = Self::load_record(&env, &address);
+        if record.status != ComplianceStatus::Suspended {
+            panic_with_error(&env, Error::NotSuspended);
+        }
+        record.status = ComplianceStatus::Approved;
+        env.storage()
+            .persistent()
+            .set(&DataKey::Record(address.clone()), &record);
+        Self::bump_instance(&env);
+        env.events()
+            .publish((symbol_short!("reinstat"), address), ());
+    }
+
     /// Remove an address entirely from the allowlist.
     pub fn remove(env: Env, admin: Address, address: Address) {
         Self::require_admin(&env, &admin);
@@ -372,6 +407,67 @@ impl ComplianceContract {
             }
         }
         all
+    }
+
+    /// Number of addresses currently on the allowlist, in O(1) — backed by a
+    /// maintained counter rather than walking `get_allowlist`'s pages.
+    ///
+    /// The counter is incremented exactly when a brand-new address is
+    /// appended to a page (`append_to_allowlist`, called from
+    /// `add_to_allowlist` the first time an address is seen) and decremented
+    /// exactly when an address is removed from its page
+    /// (`remove_from_allowlist`, called from `remove`). `suspend` only flips
+    /// `KycRecord::status` — the address's page membership (and thus this
+    /// counter) is untouched, which matches `get_allowlist`'s existing
+    /// behaviour of listing suspended addresses too.
+    pub fn get_allowlist_count(env: Env) -> u32 {
+        env.storage()
+            .instance()
+            .get(&DataKey::AllowlistCount)
+            .unwrap_or(0u32)
+    }
+
+    /// Page through the allowlist without transferring the whole list.
+    ///
+    /// `offset` is the number of addresses to skip from the start of the
+    /// allowlist; `limit` is the maximum number of addresses to return.
+    /// `limit` is clamped to [`MAX_ALLOWLIST_PAGE_SIZE`] — passing `0` or a
+    /// value above the maximum returns up to the maximum page size. Passing
+    /// an `offset` at or beyond the end of the list returns an empty `Vec`,
+    /// which is how callers detect the final page.
+    pub fn get_allowlist_page(env: Env, offset: u32, limit: u32) -> Vec<Address> {
+        let limit = if limit == 0 || limit > MAX_ALLOWLIST_PAGE_SIZE {
+            MAX_ALLOWLIST_PAGE_SIZE
+        } else {
+            limit
+        };
+        let mut result = Vec::new(&env);
+        let mut skipped: u32 = 0;
+        let (current_page, _) = Self::allowlist_meta(&env);
+        for page_idx in 0..=current_page {
+            if result.len() as u32 >= limit {
+                break;
+            }
+            let page: Option<Vec<Address>> = env
+                .storage()
+                .persistent()
+                .get(&DataKey::AllowlistPage(page_idx));
+            let page = match page {
+                Some(p) if !p.is_empty() => p,
+                _ => continue,
+            };
+            for a in page.iter() {
+                if skipped < offset {
+                    skipped += 1;
+                    continue;
+                }
+                if result.len() as u32 >= limit {
+                    break;
+                }
+                result.push_back(a);
+            }
+        }
+        result
     }
 
     /// Block an entire jurisdiction (country code). Approved addresses in a
@@ -639,6 +735,15 @@ impl ComplianceContract {
         env.storage()
             .instance()
             .set(&DataKey::AllowlistMeta, &(page_idx, page_len));
+
+        let count: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::AllowlistCount)
+            .unwrap_or(0u32);
+        env.storage()
+            .instance()
+            .set(&DataKey::AllowlistCount, &(count + 1));
     }
 
     /// Remove an address from whichever page it lives on. Leaves the page
@@ -691,6 +796,15 @@ impl ComplianceContract {
         env.storage()
             .persistent()
             .remove(&DataKey::AllowlistPageOf(address.clone()));
+
+        let count: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::AllowlistCount)
+            .unwrap_or(0u32);
+        env.storage()
+            .instance()
+            .set(&DataKey::AllowlistCount, &count.saturating_sub(1));
     }
 }
 
