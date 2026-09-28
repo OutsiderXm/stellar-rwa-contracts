@@ -43,6 +43,41 @@ cargo test -p compliance
 > cargo update -p ed25519-dalek@3.0.0 --precise 2.2.0
 > ```
 
+## Contract interface specs
+
+The build emits a machine-readable interface specification per contract
+(`asset-token`, `compliance`, `dividend`, `registry`) so downstream consumers
+can generate bindings instead of hand-maintaining their view of the interfaces.
+
+```bash
+# produce the specs under target/specs/
+make specs
+```
+
+Each spec is written to `target/specs/<contract>.json`. CI runs the same target
+and attaches the specs to every workflow run as the `contract-specs` artifact,
+so you can download the exact interfaces for a given commit from the run's
+**Artifacts** section.
+
+### Consuming the specs
+
+Both the web app and the API generate their bindings from the published specs
+rather than duplicating the interface definitions:
+
+```bash
+# fetch the specs from a CI run (or build them locally with `make specs`)
+gh run download <run-id> -n contract-specs -D target/specs
+
+# generate TypeScript bindings for the web app
+stellar contract bindings typescript \
+  --wasm target/wasm32v1-none/release/asset_token.wasm \
+  --output-dir ../stellar-rwa-web/src/bindings/asset-token
+```
+
+Regenerate the bindings whenever a spec changes and commit the result in the
+consuming repo. Treat the specs as the source of truth for the contract
+interfaces; do not edit generated bindings by hand.
+
 ## Deploy to Testnet
 
 ```bash
@@ -52,6 +87,32 @@ NETWORK=testnet IDENTITY=rwa-admin ./scripts/deploy.sh
 This funds the identity, builds, deploys and initializes all four contracts,
 approves the issuer on compliance, deploys a sample asset, and registers it.
 Copy the printed contract ids into [DEPLOYMENTS.md](DEPLOYMENTS.md).
+
+## Changelog convention
+
+Every change that touches contract source (`contracts/**`) must come with a
+`CHANGELOG.md` entry — updating the changelog is part of the definition of done.
+CI flags any pull request that modifies `contracts/**` without also modifying
+`CHANGELOG.md`.
+
+Add your entry under the `## [Unreleased]` heading, in the appropriate
+subsection (`Added`, `Changed`, `Deprecated`, `Removed`, `Fixed`, `Security`),
+using the [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) format:
+
+```markdown
+## [Unreleased]
+
+### Added
+- `compliance`: block transfers to sanctioned jurisdictions (#123)
+```
+
+Guidelines:
+
+- One bullet per user-visible change; reference the issue or PR number.
+- Prefix the bullet with the affected contract or area (e.g. `asset-token:`).
+- Keep entries concise and written for integrators, not for the diff.
+- When a release is cut, move the `Unreleased` entries under a new version
+  heading with the release date.
 
 ## The compliance model & cross-contract calls
 

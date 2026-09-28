@@ -3,6 +3,21 @@
 All notable changes to the Stellar RWA contracts are documented here. The format
 is based on [Keep a Changelog](https://keepachangelog.com/).
 
+Every change that touches contract source (`contracts/**`) must add an entry
+under the `Unreleased` section below. See [CONTRIBUTING.md](CONTRIBUTING.md) for
+the full convention; CI flags contract changes that do not update this file.
+
+## [Unreleased]
+
+### Added
+- Nothing yet.
+
+### Changed
+- Nothing yet.
+
+### Fixed
+- Nothing yet.
+
 ## [0.1.0] - 2026-07-08
 
 ### Added
