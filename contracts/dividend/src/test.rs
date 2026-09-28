@@ -148,6 +148,33 @@ fn test_claim_is_proportional() {
     assert_eq!(ctx.dividend.get_distribution(&id).distributed, 300);
 }
 
+// A zero-decimal asset token has integer-only holdings. A payment smaller than
+// the snapshot denominator can therefore produce a zero proportional claim.
+#[test]
+fn test_zero_decimal_asset_small_claim_rounds_to_zero() {
+    let ctx = setup();
+    assert_eq!(
+        AssetTokenContractClient::new(&ctx.env, &ctx.asset_id)
+            .get_metadata()
+            .decimals,
+        0
+    );
+
+    let snapshot = Vec::from_array(
+        &ctx.env,
+        [
+            (ctx.h1.clone(), 1i128),
+            (ctx.h2.clone(), 999i128),
+        ],
+    );
+    let id = ctx
+        .dividend
+        .create_distribution(&ctx.admin, &ctx.asset_id, &ctx.pay_id, &1, &snapshot);
+
+    // 1 payment unit * 1 asset unit / 1000 snapshot units floors to zero.
+    assert_eq!(ctx.dividend.claimable(&id, &ctx.h1), 0);
+}
+
 proptest! {
     #[test]
     fn prop_distribution_claims_never_exceed_proportional_share(
@@ -771,4 +798,120 @@ fn test_create_distribution_allows_zero_balance_entry() {
     assert_eq!(ctx.dividend.claimable(&id, &ctx.h1), 300);
     assert_eq!(ctx.dividend.claimable(&id, &ctx.h2), 0);
     assert_eq!(ctx.dividend.claimable(&id, &ctx.admin), 500);
+}
+
+// Issue #365: Reject distributions with an empty eligible list.
+#[test]
+#[should_panic(expected = "Error(Contract, #5)")]
+fn test_create_distribution_rejects_empty_eligible_list() {
+    let ctx = setup();
+    let empty = Vec::new(&ctx.env);
+    ctx.dividend.create_distribution(
+        &ctx.admin,
+        &ctx.asset_id,
+        &ctx.pay_id,
+        &1000,
+        &empty,
+    );
+}
+
+// Issue #366: Allow cancelling a distribution before any claim is made.
+#[test]
+fn test_cancel_distribution_before_claims() {
+    let ctx = setup();
+    let div_addr = ctx.dividend.address.clone();
+    let id = ctx.dividend.create_distribution(
+        &ctx.admin,
+        &ctx.asset_id,
+        &ctx.pay_id,
+        &1000,
+        &eligible(&ctx),
+    );
+    assert_eq!(pay_balance(&ctx, &div_addr), 1000);
+
+    // Cancel the distribution; funds should return to admin.
+    ctx.dividend.cancel_distribution(&ctx.admin, &id);
+    assert_eq!(pay_balance(&ctx, &div_addr), 0);
+    assert_eq!(pay_balance(&ctx, &ctx.admin), 100_000);
+}
+
+// Issue #366: Reject cancellation after any claim is made.
+#[test]
+#[should_panic(expected = "Error(Contract, #5)")]
+fn test_cancel_distribution_after_claim_fails() {
+    let ctx = setup();
+    let id = ctx.dividend.create_distribution(
+        &ctx.admin,
+        &ctx.asset_id,
+        &ctx.pay_id,
+        &1000,
+        &eligible(&ctx),
+    );
+    ctx.dividend.claim(&id, &ctx.h1);
+
+    // Attempt to cancel after a claim has been made; should fail.
+    ctx.dividend.cancel_distribution(&ctx.admin, &id);
+}
+
+// Issue #367: Test claiming against a distribution whose payment token has
+// unusual (different) decimals from the asset token.
+#[test]
+fn test_claim_with_unusual_payment_token_decimals() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let admin = Address::generate(&env);
+
+    // Compliance with admin + two holders approved.
+    let comp_id = env.register(ComplianceContract, ());
+    let comp = ComplianceContractClient::new(&env, &comp_id);
+    comp.initialize(&admin);
+    let us = String::from_str(&env, "US");
+    let h1 = Address::generate(&env);
+    comp.add_to_allowlist(&admin, &admin, &us, &0);
+    comp.add_to_allowlist(&admin, &h1, &us, &0);
+
+    // Asset token: supply 1000 with 7 decimals.
+    let asset_id = env.register(AssetTokenContract, ());
+    let asset = AssetTokenContractClient::new(&env, &asset_id);
+    asset.initialize(
+        &admin,
+        &String::from_str(&env, "Loft"),
+        &String::from_str(&env, "LFT"),
+        &String::from_str(&env, "real_estate"),
+        &1000i128,
+        &7u32,
+        &comp_id,
+        &String::from_str(&env, "desc"),
+        &1000i128,
+    );
+    asset.transfer(&admin, &h1, &600);
+
+    // Payment token (SAC) with 2 decimals (e.g., USDC variant).
+    let sac = env.register_stellar_asset_contract_v2(admin.clone());
+    let pay_id = sac.address();
+    token::StellarAssetClient::new(&env, &pay_id).mint(&admin, &10_000);
+
+    let div_id = env.register(DividendContract, ());
+    let dividend = DividendContractClient::new(&env, &div_id);
+    dividend.initialize(&admin);
+
+    // Create distribution: 10_000 payment tokens for snapshot: admin=400, h1=600.
+    let mut eligible = Vec::new(&env);
+    eligible.push_back((admin.clone(), 400i128));
+    eligible.push_back((h1.clone(), 600i128));
+    let dist_id = dividend.create_distribution(
+        &admin,
+        &asset_id,
+        &pay_id,
+        &10_000,
+        &eligible,
+    );
+
+    // h1 should get 600/1000 * 10_000 = 6_000 (even with decimal differences).
+    assert_eq!(dividend.claimable(&dist_id, &h1), 6_000);
+    dividend.claim(&dist_id, &h1);
+    assert_eq!(
+        token::TokenClient::new(&env, &pay_id).balance(&h1),
+        6_000
+    );
 }
