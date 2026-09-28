@@ -95,11 +95,11 @@ pub enum Error {
     Overflow = 9,
     InvalidInput = 10,
     InvalidCompliance = 11,
-    InsufficientAllowance = 12,
-    ValuationChangeTooLarge = 13,
     /// `accept_admin` or `cancel_admin_proposal` called with no pending
     /// admin proposal on file (issue #4).
     NoPendingAdmin = 12,
+    InsufficientAllowance = 13,
+    ValuationChangeTooLarge = 14,
 }
 
 /// Maximum byte lengths for string metadata fields (issue #46).
@@ -492,7 +492,10 @@ impl AssetTokenContract {
         Self::metadata(&env).total_supply
     }
 
-    /// Pause every balance-changing operation. Admin only.
+    /// Pause every balance-changing operation. Callable by the admin, or by
+    /// the optional guardian (issue #1) if one has been set via
+    /// `set_guardian`. The guardian cannot unpause, mint, or perform any
+    /// other admin action.
     ///
     /// Policy: while paused, `transfer`, `transfer_from`, `mint`,
     /// `mint_batch` and `burn` all revert with `Error::Paused`. `approve` is
@@ -502,12 +505,6 @@ impl AssetTokenContract {
     /// This is intentionally total: a pause is meant to freeze token state
     /// during an incident, not just block trading while admin actions
     /// continue.
-    pub fn pause(env: Env, admin: Address) {
-        let mut meta = Self::require_admin(&env, &admin);
-    /// Pause all transfers and mints. Callable by the admin, or by the
-    /// optional guardian (issue #1) if one has been set via
-    /// `set_guardian`. The guardian cannot unpause, mint, or perform any
-    /// other admin action.
     pub fn pause(env: Env, caller: Address) {
         caller.require_auth();
         let mut meta = Self::metadata(&env);
@@ -552,6 +549,7 @@ impl AssetTokenContract {
     /// `MAX_VALUATION_CHANGE_BPS` of its previous value (see the constant's
     /// doc comment for the reasoning). Larger re-appraisals must be phased
     /// in across multiple `update_valuation` calls.
+    ///
     /// This updates only the token metadata. If this token is also registered
     /// in the registry, the registry's valuation is an independent snapshot
     /// from registration and is not updated by this call. Clients and

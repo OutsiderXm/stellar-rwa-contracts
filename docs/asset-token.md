@@ -45,36 +45,6 @@ distribution flow.
 - `transfer_from` rejected once the approved amount is exceeded.
 - `transfer_from` rejected once `expiration_ledger` has passed (expiry).
 - `allowance` reading back `0` for an expired approval.
-# Asset Token Contract
-
-A compliant token representing a tokenized real-world asset. Every `transfer`
-checks the compliance contract for **both** sender and recipient, and every
-`mint` checks the recipient — so only KYC-approved addresses can hold the asset.
-
-- Testnet: `CBMCWLSQSWUTLUJFCNBHNBSXMUM3XU7NAQ5TSNERW4HA4ZZBYHLG4ECZ`
-
-## The compliance check (core feature)
-
-`transfer` and `mint` call into the compliance contract via a lightweight
-generated client:
-
-```rust
-#[contractclient(name = "ComplianceClient")]
-pub trait ComplianceInterface {
-    fn is_allowed(env: Env, address: Address) -> bool;
-}
-// inside transfer:
-if !ComplianceClient::new(&env, &meta.compliance_contract).is_allowed(&from) {
-    // -> SenderNotCompliant (#7)
-}
-if !ComplianceClient::new(&env, &meta.compliance_contract).is_allowed(&to) {
-    // -> RecipientNotCompliant (#8)
-}
-```
-
-This decouples the two contracts at build time — the token only knows the
-compliance *interface*, and the concrete compliance contract address is stored
-in metadata and can be swapped with `set_compliance`.
 
 ## `AssetMetadata`
 
@@ -110,7 +80,7 @@ in metadata and can be swapped with `set_compliance`.
 - `burn(from, amount)` — `from` auth; reduces caller balance and supply.
 - `balance(id) -> i128`
 - `total_supply() -> i128`
-- `pause(admin)` / `unpause(admin)` — admin auth.
+- `pause(caller)` — admin auth, or the optional guardian's; `unpause(admin)` — admin auth only.
 - `get_metadata() -> AssetMetadata`
 - `update_valuation(admin, new_valuation)` — admin auth.
 - `set_compliance(admin, compliance)` — admin auth; repoints the gate.
@@ -173,6 +143,11 @@ confirmed, so the swap can be rolled back by repointing to it if needed.
 | 7    | SenderNotCompliant     | sender fails `is_allowed`            |
 | 8    | RecipientNotCompliant  | recipient fails `is_allowed`         |
 | 9    | Overflow               | supply overflow on mint              |
+| 10   | InvalidInput           | invalid argument                     |
+| 11   | InvalidCompliance      | compliance contract rejects the admin |
+| 12   | NoPendingAdmin         | `accept_admin`/`cancel_admin_proposal` with nothing pending |
+| 13   | InsufficientAllowance  | `transfer_from` over allowance / expired |
+| 14   | ValuationChangeTooLarge | single `update_valuation` moves value beyond the per-update cap |
 
 ## Events
 

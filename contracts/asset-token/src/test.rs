@@ -71,7 +71,7 @@ fn test_approve_then_transfer_from() {
 }
 
 #[test]
-#[should_panic(expected = "Error(Contract, #12)")]
+#[should_panic(expected = "Error(Contract, #13)")]
 fn test_transfer_from_over_allowance_rejected() {
     let s = setup(1_000);
     let bob = Address::generate(&s.env);
@@ -85,7 +85,7 @@ fn test_transfer_from_over_allowance_rejected() {
 }
 
 #[test]
-#[should_panic(expected = "Error(Contract, #12)")]
+#[should_panic(expected = "Error(Contract, #13)")]
 fn test_transfer_from_after_expiry_rejected() {
     let s = setup(1_000);
     let bob = Address::generate(&s.env);
@@ -543,7 +543,7 @@ fn test_update_valuation_negative_rejected() {
 }
 
 #[test]
-#[should_panic(expected = "Error(Contract, #13)")]
+#[should_panic(expected = "Error(Contract, #14)")]
 fn test_update_valuation_oversized_change_rejected() {
     let s = setup(1_000);
     // Initial valuation is 50_000_000; more than a 50% jump must be rejected.
@@ -553,9 +553,10 @@ fn test_update_valuation_oversized_change_rejected() {
 #[test]
 fn test_update_valuation_emits_event() {
     let s = setup(1_000);
-    let count_before = s.env.events().all().events().len();
     s.token.update_valuation(&s.admin, &60_000_000);
-    assert_eq!(s.env.events().all().events().len(), count_before + 1);
+    // `events().all()` reflects the most recent contract invocation only, so
+    // read it immediately after the call under test.
+    assert_eq!(s.env.events().all().events().len(), 1);
     assert_eq!(s.token.get_metadata().valuation, 60_000_000);
 }
 
@@ -581,10 +582,12 @@ fn test_set_compliance_emits_old_and_new_addresses() {
     approve(&s.env, &comp2, &s.admin, &s.admin);
     let old_compliance = s.token.get_metadata().compliance_contract;
     s.token.set_compliance(&s.admin, &comp2_id);
-    assert_eq!(old_compliance, s.compliance_id);
-    assert_eq!(s.token.get_metadata().compliance_contract, comp2_id);
+    // Read events right after the call: `events().all()` only reflects the
+    // most recent contract invocation, and a later view call would clear it.
     let all_events = s.env.events().all();
     assert!(!all_events.events().is_empty());
+    assert_eq!(old_compliance, s.compliance_id);
+    assert_eq!(s.token.get_metadata().compliance_contract, comp2_id);
 }
 
 #[test]

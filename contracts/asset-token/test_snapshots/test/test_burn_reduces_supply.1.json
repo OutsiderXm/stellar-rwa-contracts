@@ -293,6 +293,18 @@
                       "key": {
                         "vec": [
                           {
+                            "symbol": "AllowlistCount"
+                          }
+                        ]
+                      },
+                      "val": {
+                        "u32": 1
+                      }
+                    },
+                    {
+                      "key": {
+                        "vec": [
+                          {
                             "symbol": "AllowlistMeta"
                           }
                         ]

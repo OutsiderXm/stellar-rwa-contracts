@@ -968,7 +968,7 @@ fn test_reinstate_preserves_jurisdiction_and_verified_at() {
 }
 
 #[test]
-#[should_panic(expected = "Error(Contract, #7)")]
+#[should_panic(expected = "Error(Contract, #8)")]
 fn test_reinstate_non_suspended_rejected() {
     let (env, client, admin) = setup();
     let user = Address::generate(&env);

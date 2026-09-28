@@ -119,6 +119,8 @@ pub enum Error {
     /// `accept_admin` or `cancel_admin_proposal` called with no pending
     /// admin proposal on file (issue #4).
     NoPendingAdmin = 7,
+    /// `reinstate` was called on an address that is not currently `Suspended`.
+    NotSuspended = 8,
 }
 
 const DAY_IN_LEDGERS: u32 = 17_280; // ~5s ledgers
@@ -301,7 +303,7 @@ impl ComplianceContract {
     /// caller to resupply `jurisdiction`/`expires_at` and overwrites
     /// `verified_at`), `reinstate` flips the status back to `Approved` and
     /// leaves `jurisdiction`, `verified_at` and `expires_at` untouched.
-    /// Admin only. Errors: `RecordNotFound (#3)`, `NotSuspended (#7)`.
+    /// Admin only. Errors: `RecordNotFound (#3)`, `NotSuspended (#8)`.
     pub fn reinstate(env: Env, admin: Address, address: Address) {
         Self::require_admin(&env, &admin);
         let mut record = Self::load_record(&env, &address);
@@ -527,6 +529,15 @@ impl ComplianceContract {
             .persistent()
             .get(&DataKey::Blocked(jurisdiction))
             .unwrap_or(false)
+    }
+
+    /// Every jurisdiction currently blocked, in the order it was first
+    /// blocked. Clients previously had to infer the blocked set from the
+    /// absence of approved addresses in a jurisdiction (a blocked
+    /// jurisdiction with no approved address is invisible that way); this
+    /// reads the contract's authoritative list directly.
+    pub fn get_blocked_jurisdictions(env: Env) -> Vec<String> {
+        Self::blocked_list(&env)
     }
 
     /// Prune expired records from the allowlist. Admin only (issue #21).

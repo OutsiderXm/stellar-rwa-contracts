@@ -76,7 +76,7 @@ Restores a `Suspended` record to `Approved` **without discarding its
 original KYC metadata** — `jurisdiction`, `verified_at`, and `expires_at`
 are left untouched, unlike calling `add_to_allowlist` again (which requires
 resupplying those fields and overwrites `verified_at`). Admin only.
-Errors: `RecordNotFound (#3)`, `NotSuspended (#7)` if the record is not
+Errors: `RecordNotFound (#3)`, `NotSuspended (#8)` if the record is not
 currently `Suspended`.
 
 ### `remove(admin, address)`
@@ -144,7 +144,8 @@ the address). The current admin can cancel a pending proposal. See
 | 4    | InvalidExpiry       | `expires_at` already in the past        |
 | 5    | Unauthorized        | Caller is not the stored admin          |
 | 6    | InvalidJurisdiction | Jurisdiction is not 2 ASCII letters after normalization |
-| 7    | NotSuspended        | `reinstate` called on a non-`Suspended` record |
+| 7    | NoPendingAdmin      | `accept_admin`/`cancel_admin_proposal` with no pending proposal |
+| 8    | NotSuspended        | `reinstate` called on a non-`Suspended` record |
 
 ## Events
 

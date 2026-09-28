@@ -277,6 +277,18 @@
                       "key": {
                         "vec": [
                           {
+                            "symbol": "AllowlistCount"
+                          }
+                        ]
+                      },
+                      "val": {
+                        "u32": 1
+                      }
+                    },
+                    {
+                      "key": {
+                        "vec": [
+                          {
                             "symbol": "AllowlistMeta"
                           }
                         ]
@@ -288,6 +300,22 @@
                           },
                           {
                             "u32": 1
+                          }
+                        ]
+                      }
+                    },
+                    {
+                      "key": {
+                        "vec": [
+                          {
+                            "symbol": "BlockedList"
+                          }
+                        ]
+                      },
+                      "val": {
+                        "vec": [
+                          {
+                            "string": "IR"
                           }
                         ]
                       }
