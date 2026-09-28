@@ -72,9 +72,11 @@ Whether a jurisdiction is currently blocked.
 ### `get_admin() -> Address`
 The configured admin. Errors: `NotInitialized (#2)`.
 
-### `transfer_admin(admin, new_admin)`
-Hands admin control to `new_admin`. Requires the **current** admin's auth.
-Errors: `Unauthorized (#5)`.
+### `propose_admin(admin, new_admin)` / `accept_admin(new_admin)` / `cancel_admin_proposal(admin)`
+Two-step admin handover: the **current** admin proposes a successor, and the
+role moves only when that successor calls `accept_admin` (proving it controls
+the address). The current admin can cancel a pending proposal. See
+[issue #4](fixes/issue-4.md).
 
 ## Errors
 

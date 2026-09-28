@@ -79,6 +79,55 @@ fn test_register_before_init_panics_not_initialized() {
     );
 }
 
+// ---- regression test: no dedup on token_contract ----
+//
+// `register_asset` has no check that `token_contract` hasn't already been
+// registered under a different issuer/name (tracked as a design gap
+// separately). This locks in the current behavior — registering the same
+// token_contract twice creates two independent entries and double-counts
+// the valuation in `total_value_locked` — so a future dedup change shows up
+// here as an intentional test update, not a silent behavior shift.
+#[test]
+fn test_register_same_token_contract_twice_creates_two_entries_and_double_counts_tvl() {
+    let (env, client, _admin) = setup();
+    let issuer_a = Address::generate(&env);
+    let issuer_b = Address::generate(&env);
+    let token_contract = Address::generate(&env);
+
+    let id_a = client.register_asset(
+        &issuer_a,
+        &token_contract,
+        &String::from_str(&env, "Asset A"),
+        &String::from_str(&env, "real_estate"),
+        &10_000,
+    );
+    let id_b = client.register_asset(
+        &issuer_b,
+        &token_contract,
+        &String::from_str(&env, "Asset B"),
+        &String::from_str(&env, "commodity"),
+        &25_000,
+    );
+
+    // Two distinct entries were created, even though `token_contract` is
+    // identical — no dedup check exists today.
+    assert_ne!(id_a, id_b);
+    assert_eq!(client.asset_count(), 2);
+
+    let entry_a = client.get_asset(&id_a);
+    let entry_b = client.get_asset(&id_b);
+    assert_eq!(entry_a.token_contract, token_contract);
+    assert_eq!(entry_b.token_contract, token_contract);
+    assert_eq!(entry_a.issuer, issuer_a);
+    assert_eq!(entry_b.issuer, issuer_b);
+    assert_ne!(entry_a.name, entry_b.name);
+
+    // TVL sums both entries' valuations even though they reference the same
+    // underlying token contract — i.e. the same real-world asset can be
+    // double-counted today.
+    assert_eq!(client.total_value_locked(), 35_000);
+}
+
 #[test]
 fn test_register_and_get_asset() {
     let (env, client, _admin) = setup();
@@ -164,6 +213,14 @@ fn test_get_assets_by_issuer() {
     register(&env, &client, &bob, "invoice", 5);
     assert_eq!(client.get_assets_by_issuer(&alice).len(), 2);
     assert_eq!(client.get_assets_by_issuer(&bob).len(), 1);
+}
+
+#[test]
+fn test_get_assets_by_issuer_with_no_assets_returns_empty() {
+    let (env, client, _admin) = setup();
+    let issuer = Address::generate(&env);
+    let result = client.get_assets_by_issuer(&issuer);
+    assert_eq!(result.len(), 0);
 }
 
 #[test]
@@ -282,6 +339,35 @@ fn test_active_count_excludes_deactivated() {
     client.deactivate_asset(&admin, &a);
     assert_eq!(client.active_count(), 1);
     assert_eq!(client.asset_count(), 2);
+}
+
+#[test]
+fn test_active_count_matches_asset_count_after_deactivations() {
+    // Stresses the asset_count()/active_count() invariant across a sequence
+    // of deactivations, not just a single before/after snapshot.
+    let (env, client, admin) = setup();
+    let issuer = Address::generate(&env);
+
+    let mut ids = Vec::new(&env);
+    for _ in 0..5 {
+        ids.push_back(register(&env, &client, &issuer, "real_estate", 100));
+    }
+
+    assert_eq!(client.asset_count(), 5);
+    assert_eq!(client.active_count(), 5);
+    assert_eq!(client.asset_count() - client.active_count(), 0);
+
+    let mut deactivated = 0u64;
+    for id in ids.iter() {
+        client.deactivate_asset(&admin, &id);
+        deactivated += 1;
+        assert_eq!(client.asset_count(), 5);
+        assert_eq!(client.active_count(), 5 - deactivated);
+        assert_eq!(client.asset_count() - client.active_count(), deactivated);
+    }
+
+    assert_eq!(client.active_count(), 0);
+    assert_eq!(client.asset_count() - client.active_count(), 5);
 }
 
 #[test]
@@ -502,4 +588,161 @@ fn test_accept_admin_with_no_pending_proposal_fails() {
     let stranger = Address::generate(&env);
     let res = client.try_accept_admin(&stranger);
     assert_eq!(res, Err(Ok(Error::NoPendingAdmin.into())));
+}
+
+#[test]
+fn test_reactivate_asset_restores_tvl_and_active_count() {
+    // Deactivation must not be permanent — reactivation restores TVL and
+    // active_count for the same asset id.
+    let (env, client, admin) = setup();
+    let issuer = Address::generate(&env);
+    let id = register(&env, &client, &issuer, "bond", 100);
+
+    client.deactivate_asset(&admin, &id);
+    assert_eq!(client.total_value_locked(), 0);
+    assert_eq!(client.active_count(), 0);
+    assert!(!client.get_asset(&id).active);
+
+    client.reactivate_asset(&admin, &id);
+    assert_eq!(client.total_value_locked(), 100);
+    assert_eq!(client.active_count(), 1);
+    assert!(client.get_asset(&id).active);
+}
+
+#[test]
+fn test_reactivate_already_active_asset_is_noop() {
+    let (env, client, admin) = setup();
+    let issuer = Address::generate(&env);
+    let id = register(&env, &client, &issuer, "bond", 100);
+
+    client.reactivate_asset(&admin, &id);
+    assert_eq!(client.total_value_locked(), 100);
+    assert_eq!(client.active_count(), 1);
+    assert!(client.get_asset(&id).active);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #3)")]
+fn test_reactivate_requires_admin() {
+    let (env, client, admin) = setup();
+    let issuer = Address::generate(&env);
+    let id = register(&env, &client, &issuer, "bond", 100);
+    client.deactivate_asset(&admin, &id);
+    client.reactivate_asset(&issuer, &id);
+}
+
+#[test]
+fn test_reactivate_unknown_id_fails() {
+    let (_env, client, admin) = setup();
+    assert_eq!(
+        client.try_reactivate_asset(&admin, &999u64),
+        Err(Ok(Error::AssetNotFound.into()))
+    );
+}
+
+#[test]
+fn test_tvl_running_total_matches_full_recomputation() {
+    // TVL must stay O(1) to read while remaining correct across every
+    // mutation. Prove the running total always equals a brute-force
+    // recomputation over every asset (active only) via get_all_assets.
+    let (env, client, admin) = setup();
+    let issuer = Address::generate(&env);
+    let a = register(&env, &client, &issuer, "real_estate", 100);
+    let b = register(&env, &client, &issuer, "invoice", 250);
+    let c = register(&env, &client, &issuer, "commodity", 75);
+
+    let recompute = |client: &RegistryContractClient| -> i128 {
+        client
+            .get_all_assets(&0, &1000)
+            .iter()
+            .filter(|e| e.active)
+            .map(|e| e.valuation)
+            .sum()
+    };
+
+    assert_eq!(client.total_value_locked(), recompute(&client));
+
+    client.deactivate_asset(&admin, &b);
+    assert_eq!(client.total_value_locked(), recompute(&client));
+
+    client.reactivate_asset(&admin, &b);
+    assert_eq!(client.total_value_locked(), recompute(&client));
+
+    client.deactivate_asset(&admin, &a);
+    client.deactivate_asset(&admin, &c);
+    assert_eq!(client.total_value_locked(), recompute(&client));
+
+    client.reactivate_asset(&admin, &a);
+    assert_eq!(client.total_value_locked(), recompute(&client));
+}
+
+#[test]
+fn test_get_assets_by_type_is_case_sensitive() {
+    // Matching rule for get_assets_by_type: byte-exact, so case must matter.
+    let (env, client, _admin) = setup();
+    let issuer = Address::generate(&env);
+    register(&env, &client, &issuer, "real_estate", 5);
+
+    assert_eq!(
+        client
+            .get_assets_by_type(&String::from_str(&env, "real_estate"))
+            .len(),
+        1
+    );
+    assert_eq!(
+        client
+            .get_assets_by_type(&String::from_str(&env, "Real_Estate"))
+            .len(),
+        0
+    );
+    assert_eq!(
+        client
+            .get_assets_by_type(&String::from_str(&env, "REAL_ESTATE"))
+            .len(),
+        0
+    );
+}
+
+#[test]
+fn test_get_assets_by_type_is_whitespace_sensitive() {
+    let (env, client, _admin) = setup();
+    let issuer = Address::generate(&env);
+    register(&env, &client, &issuer, "invoice", 5);
+
+    assert_eq!(
+        client
+            .get_assets_by_type(&String::from_str(&env, "invoice"))
+            .len(),
+        1
+    );
+    assert_eq!(
+        client
+            .get_assets_by_type(&String::from_str(&env, " invoice"))
+            .len(),
+        0
+    );
+    assert_eq!(
+        client
+            .get_assets_by_type(&String::from_str(&env, "invoice "))
+            .len(),
+        0
+    );
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #7)")]
+fn test_register_rejects_asset_type_with_whitespace() {
+    // A padded variant of a valid type must still be rejected at
+    // registration, not silently normalised.
+    let (env, client, _admin) = setup();
+    let issuer = Address::generate(&env);
+    register(&env, &client, &issuer, "invoice ", 100);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #7)")]
+fn test_register_rejects_asset_type_with_wrong_case() {
+    let (env, client, _admin) = setup();
+    let issuer = Address::generate(&env);
+    register(&env, &client, &issuer, "Invoice", 100);
 }

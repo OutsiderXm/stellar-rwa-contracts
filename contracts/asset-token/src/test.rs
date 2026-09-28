@@ -3,7 +3,7 @@ use super::*;
 use compliance::{ComplianceContract, ComplianceContractClient};
 use proptest::prelude::*;
 use soroban_sdk::{
-    testutils::{Address as _, AuthorizedFunction, Events},
+    testutils::{Address as _, AuthorizedFunction, Events, Ledger},
     Address, Env, String, Symbol, Vec,
 };
 
@@ -442,6 +442,8 @@ fn test_admin_still_pauses_with_guardian_set() {
 #[test]
 fn test_update_valuation() {
     let s = setup(1_000);
+    // Valuation is local token metadata; a separately registered valuation is
+    // not synchronized by this call.
     s.token.update_valuation(&s.admin, &75_000_000);
     assert_eq!(s.token.get_metadata().valuation, 75_000_000);
 }
@@ -522,6 +524,21 @@ fn test_burn_blocked_when_holder_not_compliant() {
     s.token.transfer(&s.admin, &bob, &200);
     // Bob now holds tokens; revoke his approval.
     s.compliance.remove(&s.admin, &bob);
+    s.token.burn(&bob, &100);
+}
+
+/// Pins the deliberate policy documented on `AssetTokenContract::burn`: a
+/// holder who is *suspended* (as opposed to fully removed) is still
+/// compliance-gated and may not burn their tokens.
+#[test]
+#[should_panic(expected = "Error(Contract, #7)")]
+fn test_burn_blocked_when_holder_suspended() {
+    let s = setup(1_000);
+    let bob = Address::generate(&s.env);
+    approve(&s.env, &s.compliance, &s.admin, &bob);
+    s.token.transfer(&s.admin, &bob, &200);
+    // Bob holds tokens; suspend (not remove) his approval.
+    s.compliance.suspend(&s.admin, &bob);
     s.token.burn(&bob, &100);
 }
 
@@ -1052,4 +1069,205 @@ fn test_admin_handover_does_not_affect_guardian() {
 
     assert_eq!(s.token.get_metadata().admin, successor);
     assert_eq!(s.token.get_metadata().guardian, Some(guardian));
+}
+
+// Issue #370: Test that token metadata survives a TTL boundary.
+#[test]
+fn test_metadata_survives_ttl_boundary() {
+    let s = setup(1_000);
+
+    // Verify metadata is readable
+    let metadata = s.token.get_metadata();
+    assert_eq!(metadata.name, String::from_str(&s.env, "Manhattan Loft"));
+    assert_eq!(metadata.symbol, String::from_str(&s.env, "MLOFT"));
+
+    // Advance ledger past TTL threshold
+    s.env.ledger().set_sequence_number(500_000);
+
+    // Verify metadata still exists after ledger advance
+    let metadata_after = s.token.get_metadata();
+    assert_eq!(
+        metadata_after.name, metadata.name,
+        "Metadata must survive TTL boundary"
+    );
+    assert_eq!(metadata_after.symbol, metadata.symbol);
+}
+
+// Issue #371: Test that account balances survive a TTL boundary.
+#[test]
+fn test_balances_survive_ttl_boundary() {
+    let s = setup(1_000);
+    let user = Address::generate(&s.env);
+    approve(&s.env, &s.compliance, &s.admin, &user);
+
+    // Initial state: admin has 1000, user has 0
+    assert_eq!(s.token.balance(&s.admin), 1_000);
+    assert_eq!(s.token.balance(&user), 0);
+
+    // Transfer some tokens
+    s.token.transfer(&s.admin, &user, &300);
+    assert_eq!(s.token.balance(&s.admin), 700);
+    assert_eq!(s.token.balance(&user), 300);
+
+    // Advance ledger past TTL threshold
+    s.env.ledger().set_sequence_number(500_000);
+
+    // Verify balances still exist after ledger advance
+    assert_eq!(
+        s.token.balance(&s.admin),
+        700,
+        "Admin balance must survive TTL boundary"
+    );
+    assert_eq!(
+        s.token.balance(&user),
+        300,
+        "User balance must survive TTL boundary"
+    );
+}
+
+// ---- extreme `decimals` documentation test ----
+//
+// `initialize` accepts any `u32` for `decimals` with no upper-bound
+// validation. `decimals` is stored as opaque metadata by this contract and is
+// never used in on-chain arithmetic here (balances/`total_supply` are raw
+// `i128` units, independent of `decimals`), so a huge `decimals` value does
+// not by itself overflow anything inside asset-token. The risk is entirely
+// downstream: a consumer (e.g. a UI, or another contract computing
+// `total_amount * basis` scaled by `10^decimals`, as `dividend` effectively
+// does when interpreting amounts) that treats `decimals` as bounded (e.g.
+// `<= 18`, matching typical token conventions) could overflow or produce
+// nonsensical results. This test documents *current* behavior: `initialize`
+// happily accepts `decimals = 255` (u8::MAX, an extreme but valid `u32`)
+// alongside a large `total_supply` and `valuation`, and all reads
+// (`get_metadata`, `total_supply`, `balance`) remain internally consistent.
+// If an upper bound is added later (closing this gap), this test's
+// expectations should change from "accepted" to "rejected".
+#[test]
+fn test_extreme_decimals_accepted_with_large_supply_and_valuation() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let compliance_id = env.register(ComplianceContract, ());
+    let compliance = ComplianceContractClient::new(&env, &compliance_id);
+    let admin = Address::generate(&env);
+    compliance.initialize(&admin);
+    approve(&env, &compliance, &admin, &admin);
+
+    let token_id = env.register(AssetTokenContract, ());
+    let token = AssetTokenContractClient::new(&env, &token_id);
+
+    // A supply and valuation near the top of what `i128` can represent,
+    // combined with an extreme decimals value, to probe for overflow or
+    // inconsistent reads in asset-token's own storage/arithmetic.
+    let huge_supply: i128 = 170_141_183_460_469_231_731_687_303_715_884_105_727 / 2;
+    let huge_valuation: i128 = huge_supply;
+    let extreme_decimals: u32 = 255;
+
+    token.initialize(
+        &admin,
+        &String::from_str(&env, "Extreme Decimals Asset"),
+        &String::from_str(&env, "XTRM"),
+        &String::from_str(&env, "real_estate"),
+        &huge_supply,
+        &extreme_decimals,
+        &compliance_id,
+        &String::from_str(&env, "Documents current no-upper-bound decimals behavior"),
+        &huge_valuation,
+    );
+
+    // `initialize` did not panic or clamp `decimals`; it is stored verbatim.
+    let meta = token.get_metadata();
+    assert_eq!(meta.decimals, extreme_decimals);
+    assert_eq!(meta.total_supply, huge_supply);
+    assert_eq!(meta.valuation, huge_valuation);
+
+    // Balance/supply bookkeeping stays internally consistent regardless of
+    // the (unrelated, unused-in-arithmetic) decimals value.
+    assert_eq!(token.balance(&admin), huge_supply);
+    assert_eq!(token.total_supply(), huge_supply);
+
+    // A subsequent mint still behaves normally: `decimals` plays no role in
+    // asset-token's own overflow checks, only in how a downstream consumer
+    // might choose to scale/interpret raw i128 amounts.
+    let bob = Address::generate(&env);
+    approve(&env, &compliance, &admin, &bob);
+    token.mint(&admin, &bob, &1_000);
+    assert_eq!(token.balance(&bob), 1_000);
+    assert_eq!(token.total_supply(), huge_supply + 1_000);
+}
+
+// Issue #376: Property test for supply conservation
+proptest! {
+    #[test]
+    fn prop_supply_conserved_after_operations(
+        mint_amounts in prop::collection::vec(1i128..100_000i128, 0..5),
+        burn_amount in 0i128..1_000_000i128,
+    ) {
+        let s = setup(1_000_000);
+        let initial_supply = s.token.total_supply();
+
+        let bob = Address::generate(&s.env);
+        approve(&s.env, &s.compliance, &s.admin, &bob);
+
+        for amount in mint_amounts {
+            s.token.mint(&s.admin, &bob, &amount);
+        }
+
+        let supply_after_mints = s.token.total_supply();
+        let bob_balance = s.token.balance(&bob);
+
+        if burn_amount <= s.token.balance(&s.admin) {
+            s.token.burn(&s.admin, &burn_amount);
+        }
+
+        let final_supply = s.token.total_supply();
+
+        // Check: sum of all balances equals total supply
+        let admin_balance = s.token.balance(&s.admin);
+        let sum_of_balances = admin_balance.saturating_add(bob_balance);
+
+        prop_assert_eq!(
+            final_supply, sum_of_balances,
+            "Supply conservation violated: total={}, sum_of_balances={}",
+            final_supply, sum_of_balances
+        );
+    }
+}
+
+// Issue #375: Property test for compliance transfer gate
+proptest! {
+    #[test]
+    fn prop_transfer_gate_enforced(
+        sender_approved in prop::bool::ANY,
+        recipient_approved in prop::bool::ANY,
+    ) {
+        let s = setup(1_000);
+        let sender = Address::generate(&s.env);
+        let recipient = Address::generate(&s.env);
+
+        if sender_approved {
+            approve(&s.env, &s.compliance, &s.admin, &sender);
+        }
+        if recipient_approved {
+            approve(&s.env, &s.compliance, &s.admin, &recipient);
+        }
+
+        // Mint to sender
+        if sender_approved {
+            s.token.mint(&s.admin, &sender, &100);
+        }
+
+        // Transfer succeeds only if BOTH are approved
+        let should_succeed = sender_approved && recipient_approved;
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            s.token.transfer(&sender, &recipient, &50);
+        }));
+
+        if should_succeed {
+            prop_assert!(result.is_ok(), "Transfer should succeed when both approved");
+        } else {
+            prop_assert!(result.is_err(), "Transfer should fail when either party not approved");
+        }
+    }
 }
