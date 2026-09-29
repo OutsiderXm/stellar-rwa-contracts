@@ -113,3 +113,6 @@ MIT — see [LICENSE](LICENSE).
 
 <!-- handsoff-issue-426 -->
 - #426: dividend: `cancel_distribution` can be called repeatedly and refunds the full amount each time, draining other distributions' escrow
+
+<!-- handsoff-issue-427 -->
+- #427: dividend: `claim` still pays out on a cancelled distribution because cancel leaves the snapshot in place and `claim` never checks `completed`
