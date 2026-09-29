@@ -160,6 +160,17 @@ jobs:
           path: target/interface-specs/*.json
           if-no-files-found: error
 
+  check-quickstart:
+    # Verify QUICKSTART.md does not reference non-existent scripts, a wrong
+    # wasm target, or the deprecated soroban-cli. Runs on every PR so doc
+    # drift is caught before merge (issue #443).
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Check QUICKSTART.md is consistent with the repo
+        run: bash scripts/check_quickstart.sh
+
   coverage:
     runs-on: ubuntu-latest
     steps:
