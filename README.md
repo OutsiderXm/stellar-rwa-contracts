@@ -110,3 +110,6 @@ MIT — see [LICENSE](LICENSE).
 
 <!-- handsoff-issue-400 -->
 - #400: Add an integration test exercising all four contracts together
+
+<!-- handsoff-issue-426 -->
+- #426: dividend: `cancel_distribution` can be called repeatedly and refunds the full amount each time, draining other distributions' escrow
