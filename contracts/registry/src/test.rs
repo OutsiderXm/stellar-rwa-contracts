@@ -168,6 +168,25 @@ fn test_get_assets_by_issuer() {
 }
 
 #[test]
+fn test_issuer_can_deactivate_asset() {
+    let (env, client, _admin) = setup();
+    let issuer = Address::generate(&env);
+    let id = register(&env, &client, &issuer, "real_estate", 100);
+    client.deactivate_asset(&issuer, &id);
+    assert!(!client.get_asset(&id).active);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #3)")]
+fn test_unrelated_address_cannot_deactivate_asset() {
+    let (env, client, _admin) = setup();
+    let issuer = Address::generate(&env);
+    let id = register(&env, &client, &issuer, "real_estate", 100);
+    let stranger = Address::generate(&env);
+    client.deactivate_asset(&stranger, &id);
+}
+
+#[test]
 fn test_get_assets_by_issuer_with_no_assets_returns_empty() {
     let (env, client, _admin) = setup();
     let issuer = Address::generate(&env);
@@ -769,4 +788,66 @@ fn test_get_all_assets_final_partial_page() {
     assert_eq!(third.len(), 1);
     let fourth = client.get_all_assets(&8, &page_size);
     assert_eq!(fourth.len(), 0);
+}
+
+// ---- name length bound (issue #439) ----
+
+/// A name exactly at the limit (MAX_NAME_LEN bytes) must be accepted.
+#[test]
+fn test_name_at_max_len_is_accepted() {
+    let (env, client, _admin) = setup();
+    let issuer = Address::generate(&env);
+    let token = Address::generate(&env);
+    // Build a 64-byte ASCII name.
+    let name_64 = String::from_str(&env, "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA");
+    assert_eq!(name_64.len(), MAX_NAME_LEN);
+    let id = client.register_asset(
+        &issuer,
+        &token,
+        &name_64,
+        &String::from_str(&env, "real_estate"),
+        &100,
+    );
+    assert_eq!(id, 1);
+}
+
+/// A name one byte over the limit must be rejected with InvalidInput (#7).
+#[test]
+#[should_panic(expected = "Error(Contract, #7)")]
+fn test_name_over_max_len_is_rejected() {
+    let (env, client, _admin) = setup();
+    let issuer = Address::generate(&env);
+    let token = Address::generate(&env);
+    // Build a 65-byte ASCII name (one byte over the limit).
+    let name_65 = String::from_str(&env, "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA");
+    assert_eq!(name_65.len(), MAX_NAME_LEN + 1);
+    client.register_asset(
+        &issuer,
+        &token,
+        &name_65,
+        &String::from_str(&env, "real_estate"),
+        &100,
+    );
+}
+
+/// A name whose visible character count is under 64 but whose byte length
+/// exceeds MAX_NAME_LEN must be rejected.  Each of the characters below is
+/// encoded as 2 bytes in UTF-8, so 33 of them total 66 bytes > 64.
+#[test]
+#[should_panic(expected = "Error(Contract, #7)")]
+fn test_name_multibyte_over_max_len_is_rejected() {
+    let (env, client, _admin) = setup();
+    let issuer = Address::generate(&env);
+    let token = Address::generate(&env);
+    // 33 × 'é' (U+00E9, 2 bytes each) = 66 bytes, 33 glyphs.
+    let name_multibyte = String::from_str(&env, "ééééééééééééééééééééééééééééééééé");
+    // byte length must exceed the limit
+    assert!(name_multibyte.len() > MAX_NAME_LEN);
+    client.register_asset(
+        &issuer,
+        &token,
+        &name_multibyte,
+        &String::from_str(&env, "real_estate"),
+        &100,
+    );
 }
