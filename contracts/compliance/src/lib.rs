@@ -28,7 +28,13 @@ use soroban_sdk::{
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ComplianceStatus {
     Approved,
+    /// Deprecated legacy ABI value. Kept only for backwards compatibility;
+    /// the contract never writes this status and no public workflow produces it.
+    #[deprecated(note = "Pending is retained for ABI compatibility only; current workflows never set it.")]
     Pending,
+    /// Deprecated legacy ABI value. Kept only for backwards compatibility;
+    /// the contract never writes this status and no public workflow produces it.
+    #[deprecated(note = "Rejected is retained for ABI compatibility only; current workflows never set it.")]
     Rejected,
     Suspended,
 }
@@ -129,7 +135,7 @@ const INSTANCE_LIFETIME_THRESHOLD: u32 = INSTANCE_BUMP_AMOUNT - DAY_IN_LEDGERS;
 
 /// Contract ABI/behavior version. Bump on any change to storage layout or
 /// externally observable behavior so clients and the indexer can detect it.
-pub const VERSION: u32 = 1;
+pub const VERSION: u32 = 2;
 
 #[contract]
 pub struct ComplianceContract;
@@ -385,8 +391,10 @@ impl ComplianceContract {
     ///   itself mean `is_allowed` returns `true`: `is_allowed` additionally
     ///   checks expiry and jurisdiction blocks, neither of which changes the
     ///   stored status.
-    /// - `Some(Pending)` / `Some(Rejected)` — reserved for future workflows;
-    ///   no current method sets these.
+    /// - `Some(Pending)` / `Some(Rejected)` — deprecated legacy variants kept
+    ///   only for ABI stability. The current contract never writes them, and
+    ///   no public method can create them. Callers should treat them as
+    ///   unreachable / unsupported values.
     /// - `Some(Suspended)` — was approved, then suspended via [`Self::suspend`].
     pub fn status_of(env: Env, address: Address) -> Option<ComplianceStatus> {
         Self::get_record(env, address).map(|r| r.status)

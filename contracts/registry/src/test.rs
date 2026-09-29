@@ -168,6 +168,25 @@ fn test_get_assets_by_issuer() {
 }
 
 #[test]
+fn test_issuer_can_deactivate_asset() {
+    let (env, client, _admin) = setup();
+    let issuer = Address::generate(&env);
+    let id = register(&env, &client, &issuer, "real_estate", 100);
+    client.deactivate_asset(&issuer, &id);
+    assert!(!client.get_asset(&id).active);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #3)")]
+fn test_unrelated_address_cannot_deactivate_asset() {
+    let (env, client, _admin) = setup();
+    let issuer = Address::generate(&env);
+    let id = register(&env, &client, &issuer, "real_estate", 100);
+    let stranger = Address::generate(&env);
+    client.deactivate_asset(&stranger, &id);
+}
+
+#[test]
 fn test_get_assets_by_issuer_with_no_assets_returns_empty() {
     let (env, client, _admin) = setup();
     let issuer = Address::generate(&env);
